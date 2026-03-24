@@ -55,11 +55,11 @@ OpenAI API Server / LLM
 
 在线模式从 OpenAI 兼容接口进入：
 
-- [`vllm/vllm/entrypoints/openai/api_server.py`](vllm/vllm/entrypoints/openai/api_server.py)
+- [`vllm/entrypoints/openai/api_server.py`](vllm/entrypoints/openai/api_server.py)
 
 服务初始化时会构建 `AsyncLLM`：
 
-- [`vllm/vllm/v1/engine/async_llm.py`](vllm/vllm/v1/engine/async_llm.py)
+- [`vllm/v1/engine/async_llm.py`](vllm/v1/engine/async_llm.py)
 
 `AsyncLLM` 初始化时主要创建：
 
@@ -77,8 +77,8 @@ OpenAI API Server / LLM
 
 对应代码：
 
-- [`vllm/vllm/v1/engine/async_llm.py`](vllm/vllm/v1/engine/async_llm.py)
-- [`vllm/vllm/v1/engine/input_processor.py`](vllm/vllm/v1/engine/input_processor.py)
+- [`vllm/v1/engine/async_llm.py`](vllm/v1/engine/async_llm.py)
+- [`vllm/v1/engine/input_processor.py`](vllm/v1/engine/input_processor.py)
 
 流式输出时，`AsyncLLM.generate()` 会持续从每个请求自己的队列里取 `RequestOutput` 并向上游返回。后台还有 `_run_output_handler()` 循环，不断从 `EngineCore` 拉输出并交给 `OutputProcessor`。
 
@@ -88,7 +88,7 @@ OpenAI API Server / LLM
 
 离线模式主要走 `LLMEngine`：
 
-- [`vllm/vllm/v1/engine/llm_engine.py`](vllm/vllm/v1/engine/llm_engine.py)
+- [`vllm/v1/engine/llm_engine.py`](vllm/v1/engine/llm_engine.py)
 
 它和 `AsyncLLM` 的区别主要在“前端表现形式”：
 
@@ -119,12 +119,12 @@ OpenAI API Server / LLM
 
 对应代码：
 
-- [`vllm/vllm/v1/engine/core.py`](vllm/vllm/v1/engine/core.py)
+- [`vllm/v1/engine/core.py`](vllm/v1/engine/core.py)
 
 如果是多进程模式，前端不会直接调用 `EngineCore`，而是通过 `EngineCoreClient` 与后台 `EngineCoreProc` 通信：
 
-- [`vllm/vllm/v1/engine/core_client.py`](vllm/vllm/v1/engine/core_client.py)
-- [`vllm/vllm/v1/engine/core.py`](vllm/vllm/v1/engine/core.py)
+- [`vllm/v1/engine/core_client.py`](vllm/v1/engine/core_client.py)
+- [`vllm/v1/engine/core.py`](vllm/v1/engine/core.py)
 
 这里通常有几种 client 形态：
 
@@ -149,8 +149,8 @@ scheduler.schedule()
 
 关键文件：
 
-- [`vllm/vllm/v1/engine/core.py`](vllm/vllm/v1/engine/core.py)
-- [`vllm/vllm/v1/core/sched/scheduler.py`](vllm/vllm/v1/core/sched/scheduler.py)
+- [`vllm/v1/engine/core.py`](vllm/v1/engine/core.py)
+- [`vllm/v1/core/sched/scheduler.py`](vllm/v1/core/sched/scheduler.py)
 
 这一步分别负责：
 
@@ -201,7 +201,7 @@ V1 与旧架构最大的区别，是它**不再硬区分 `prefill` 和 `decode`*
 
 相关实现：
 
-- [`vllm/vllm/v1/core/sched/scheduler.py`](vllm/vllm/v1/core/sched/scheduler.py)
+- [`vllm/v1/core/sched/scheduler.py`](vllm/v1/core/sched/scheduler.py)
 
 所以 V1 的调度方式不是：
 
@@ -248,8 +248,8 @@ V1 与旧架构最大的区别，是它**不再硬区分 `prefill` 和 `decode`*
 
 相关代码：
 
-- [`vllm/vllm/v1/executor/abstract.py`](vllm/vllm/v1/executor/abstract.py)
-- [`vllm/vllm/v1/executor/multiproc_executor.py`](vllm/vllm/v1/executor/multiproc_executor.py)
+- [`vllm/v1/executor/abstract.py`](vllm/v1/executor/abstract.py)
+- [`vllm/v1/executor/multiproc_executor.py`](vllm/v1/executor/multiproc_executor.py)
 
 ### 7.2 Worker
 
@@ -266,7 +266,7 @@ V1 与旧架构最大的区别，是它**不再硬区分 `prefill` 和 `decode`*
 
 相关代码：
 
-- [`vllm/vllm/v1/worker/gpu_worker.py`](vllm/vllm/v1/worker/gpu_worker.py)
+- [`vllm/v1/worker/gpu_worker.py`](vllm/v1/worker/gpu_worker.py)
 
 ### 7.3 ModelRunner
 
@@ -291,7 +291,7 @@ V1 与旧架构最大的区别，是它**不再硬区分 `prefill` 和 `decode`*
 
 相关代码：
 
-- [`vllm/vllm/v1/worker/gpu_model_runner.py`](vllm/vllm/v1/worker/gpu_model_runner.py)
+- [`vllm/v1/worker/gpu_model_runner.py`](vllm/v1/worker/gpu_model_runner.py)
 
 一句话概括：
 
@@ -305,7 +305,7 @@ V1 与旧架构最大的区别，是它**不再硬区分 `prefill` 和 `decode`*
 
 模型结果不会直接原样返回给用户，而是先经过 `OutputProcessor`：
 
-- [`vllm/vllm/v1/engine/output_processor.py`](vllm/vllm/v1/engine/output_processor.py)
+- [`vllm/v1/engine/output_processor.py`](vllm/v1/engine/output_processor.py)
 
 这一层主要负责：
 
@@ -334,11 +334,11 @@ EngineCoreOutput
 
 你现在打开的几个文件，对应关系可以这样看：
 
-- [`vllm-ascend/vllm_ascend/platform.py`](vllm-ascend/vllm_ascend/platform.py)
+- [`../vllm-ascend/vllm_ascend/platform.py`](../vllm-ascend/vllm_ascend/platform.py)
   - 定义 Ascend 平台能力、平台相关行为
-- [`vllm-ascend/vllm_ascend/worker/model_runner_v1.py`](vllm-ascend/vllm_ascend/worker/model_runner_v1.py)
+- [`../vllm-ascend/vllm_ascend/worker/model_runner_v1.py`](../vllm-ascend/vllm_ascend/worker/model_runner_v1.py)
   - 适配 V1 路径上的 model runner 执行逻辑
-- [`vllm-ascend/vllm_ascend/worker/v2/model_runner.py`](vllm-ascend/vllm_ascend/worker/v2/model_runner.py)
+- [`../vllm-ascend/vllm_ascend/worker/v2/model_runner.py`](../vllm-ascend/vllm_ascend/worker/v2/model_runner.py)
   - Ascend 上更具体的执行路径实现
 
 所以可以把两者关系概括为：
@@ -367,22 +367,22 @@ vllm-ascend 提供：
 
 如果你想顺着源码建立全局认识，推荐按这个顺序读：
 
-1. [`vllm/vllm/entrypoints/openai/api_server.py`](vllm/vllm/entrypoints/openai/api_server.py)
-2. [`vllm/vllm/v1/engine/async_llm.py`](vllm/vllm/v1/engine/async_llm.py)
-3. [`vllm/vllm/v1/engine/input_processor.py`](vllm/vllm/v1/engine/input_processor.py)
-4. [`vllm/vllm/v1/engine/core_client.py`](vllm/vllm/v1/engine/core_client.py)
-5. [`vllm/vllm/v1/engine/core.py`](vllm/vllm/v1/engine/core.py)
-6. [`vllm/vllm/v1/core/sched/scheduler.py`](vllm/vllm/v1/core/sched/scheduler.py)
-7. [`vllm/vllm/v1/executor/abstract.py`](vllm/vllm/v1/executor/abstract.py)
-8. [`vllm/vllm/v1/worker/gpu_worker.py`](vllm/vllm/v1/worker/gpu_worker.py)
-9. [`vllm/vllm/v1/worker/gpu_model_runner.py`](vllm/vllm/v1/worker/gpu_model_runner.py)
-10. [`vllm/vllm/v1/engine/output_processor.py`](vllm/vllm/v1/engine/output_processor.py)
+1. [`vllm/entrypoints/openai/api_server.py`](vllm/entrypoints/openai/api_server.py)
+2. [`vllm/v1/engine/async_llm.py`](vllm/v1/engine/async_llm.py)
+3. [`vllm/v1/engine/input_processor.py`](vllm/v1/engine/input_processor.py)
+4. [`vllm/v1/engine/core_client.py`](vllm/v1/engine/core_client.py)
+5. [`vllm/v1/engine/core.py`](vllm/v1/engine/core.py)
+6. [`vllm/v1/core/sched/scheduler.py`](vllm/v1/core/sched/scheduler.py)
+7. [`vllm/v1/executor/abstract.py`](vllm/v1/executor/abstract.py)
+8. [`vllm/v1/worker/gpu_worker.py`](vllm/v1/worker/gpu_worker.py)
+9. [`vllm/v1/worker/gpu_model_runner.py`](vllm/v1/worker/gpu_model_runner.py)
+10. [`vllm/v1/engine/output_processor.py`](vllm/v1/engine/output_processor.py)
 
 如果你的重点是 Ascend 适配，再接着读：
 
-1. [`vllm-ascend/vllm_ascend/platform.py`](vllm-ascend/vllm_ascend/platform.py)
-2. [`vllm-ascend/vllm_ascend/worker/model_runner_v1.py`](vllm-ascend/vllm_ascend/worker/model_runner_v1.py)
-3. [`vllm-ascend/vllm_ascend/worker/v2/model_runner.py`](vllm-ascend/vllm_ascend/worker/v2/model_runner.py)
+1. [`../vllm-ascend/vllm_ascend/platform.py`](../vllm-ascend/vllm_ascend/platform.py)
+2. [`../vllm-ascend/vllm_ascend/worker/model_runner_v1.py`](../vllm-ascend/vllm_ascend/worker/model_runner_v1.py)
+3. [`../vllm-ascend/vllm_ascend/worker/v2/model_runner.py`](../vllm-ascend/vllm_ascend/worker/v2/model_runner.py)
 
 ---
 

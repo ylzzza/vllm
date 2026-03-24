@@ -60,7 +60,7 @@ from vllm.version import __version__ as VLLM_VERSION
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
-# Cannot use __name__ (https://github.com/vllm-project/vllm/pull/4765)
+# 这里不能直接使用 __name__，见 https://github.com/vllm-project/vllm/pull/4765
 logger = init_logger("vllm.entrypoints.openai.api_server")
 
 _FALLBACK_SUPPORTED_TASKS: tuple[SupportedTask, ...] = ("generate",)
@@ -74,19 +74,23 @@ async def build_async_engine_client(
     disable_frontend_multiprocessing: bool | None = None,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
+    """根据 CLI 参数为单个 API worker 构建 EngineClient。"""
     if os.getenv("VLLM_WORKER_MULTIPROC_METHOD") == "forkserver":
-        # The executor is expected to be mp.
-        # Pre-import heavy modules in the forkserver process
+        # 这里默认执行器会走多进程。
+        # 在 forkserver 进程里预加载较重的 AsyncLLM 相关模块，避免每个子进程
+        # 重复 import，减少启动开销和潜在副作用。
         logger.debug("Setup forkserver with pre-imports")
         multiprocessing.set_start_method("forkserver")
         multiprocessing.set_forkserver_preload(["vllm.v1.engine.async_llm"])
         forkserver.ensure_running()
         logger.debug("Forkserver setup complete!")
 
-    # Context manager to handle engine_client lifecycle
-    # Ensures everything is shutdown and cleaned up on error/exit
+    # 把面向 CLI 的服务参数转成 V1 运行时可理解的 engine 配置，并通过
+    # context manager 保证退出时能正确释放 engine 资源。
     engine_args = AsyncEngineArgs.from_cli_args(args)
     if client_config:
+        # 前端多进程模式下，会给每个 API worker 分配 rank/count，方便它们
+        # 共享同一套后端拓扑并完成协同。
         engine_args._api_process_count = client_config.get("client_count", 1)
         engine_args._api_process_rank = client_config.get("client_index", 0)
 
@@ -111,14 +115,14 @@ async def build_async_engine_client_from_engine_args(
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
     """
-    Create EngineClient, either:
-        - in-process using the AsyncLLMEngine Directly
-        - multiprocess using AsyncLLMEngine RPC
+    创建 EngineClient，主要有两种形态：
+        - 进程内直接使用 AsyncLLM
+        - 多进程模式下通过 RPC 使用 AsyncLLM
 
-    Returns the Client or None if the creation failed.
+    如果创建失败，不会返回可用的 client。
     """
 
-    # Create the EngineConfig (determines if we can use V1).
+    # 先构建 EngineConfig，这一步也会决定当前是否走 V1 运行时。
     vllm_config = engine_args.create_engine_config(usage_context=usage_context)
 
     if disable_frontend_multiprocessing:
@@ -128,11 +132,11 @@ async def build_async_engine_client_from_engine_args(
 
     async_llm: AsyncLLM | None = None
 
-    # Don't mutate the input client_config
+    # 避免直接修改调用方传入的 client_config。
     client_config = dict(client_config) if client_config else {}
     client_count = client_config.pop("client_count", 1)
     client_index = client_config.pop("client_index", 0)
-
+    ### ylzzz 创建 LLMEngine
     try:
         async_llm = AsyncLLM.from_vllm_config(
             vllm_config=vllm_config,
@@ -145,7 +149,7 @@ async def build_async_engine_client_from_engine_args(
             client_index=client_index,
         )
 
-        # Don't keep the dummy data in memory
+        # 初始化阶段可能留下占位用的多模态缓存，这里顺手清掉。
         assert async_llm is not None
         await async_llm.reset_mm_cache()
 
@@ -158,6 +162,7 @@ async def build_async_engine_client_from_engine_args(
 def build_app(
     args: Namespace, supported_tasks: tuple["SupportedTask", ...] | None = None
 ) -> FastAPI:
+    """组装 FastAPI 应用，并只注册当前 engine 真正支持的路由。"""
     if supported_tasks is None:
         warnings.warn(
             "The 'supported_tasks' parameter was not provided to "
@@ -178,6 +183,7 @@ def build_app(
         app = FastAPI(lifespan=lifespan)
     app.state.args = args
 
+    # 先挂通用服务路由，再按任务类型叠加 OpenAI 兼容路由。
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
     register_vllm_serve_api_routers(app)
@@ -250,7 +256,7 @@ def build_app(
     app.exception_handler(HTTPException)(http_exception_handler)
     app.exception_handler(RequestValidationError)(validation_exception_handler)
 
-    # Ensure --api-key option from CLI takes precedence over VLLM_API_KEY
+    # CLI 传入的 --api-key 优先级高于环境变量 VLLM_API_KEY。
     if tokens := [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]:
         from vllm.entrypoints.openai.server_utils import AuthenticationMiddleware
 
@@ -261,7 +267,7 @@ def build_app(
 
         app.add_middleware(XRequestIdMiddleware)
 
-    # Add scaling middleware to check for scaling state
+    # 加上扩缩容中间件，用于感知当前实例的 scaling 状态。
     app.add_middleware(ScalingMiddleware)
 
     if envs.VLLM_DEBUG_LOG_API_SERVER_RESPONSE:
@@ -272,6 +278,8 @@ def build_app(
         )
         app.middleware("http")(log_response)
 
+    # 支持用户通过模块路径注入自定义 middleware，这样部署侧可以扩展鉴权、
+    # tracing 或请求处理逻辑，而不用直接改 vLLM 源码。
     for middleware in args.middleware:
         module_path, object_name = middleware.rsplit(".", 1)
         imported = getattr(importlib.import_module(module_path), object_name)
@@ -294,6 +302,7 @@ async def init_app_state(
     args: Namespace,
     supported_tasks: tuple["SupportedTask", ...] | None = None,
 ) -> None:
+    """把路由处理阶段会反复复用的长生命周期对象放进 app.state。"""
     vllm_config = engine_client.vllm_config
     if supported_tasks is None:
         warnings.warn(
@@ -315,6 +324,8 @@ async def init_app_state(
     else:
         request_logger = None
 
+    # 一个服务可以对外暴露多个模型名别名，但它们底层仍然指向当前进程加载的
+    # 同一个 model_path。
     base_model_paths = [
         BaseModelPath(name=name, model_path=args.model) for name in served_model_names
     ]
@@ -325,7 +336,7 @@ async def init_app_state(
     state.args = args
     resolved_chat_template = load_chat_template(args.chat_template)
 
-    # Merge default_mm_loras into the static lora_modules
+    # 把默认多模态 LoRA 合并进静态 LoRA 配置。
     default_mm_loras = (
         vllm_config.lora_config.default_mm_loras
         if vllm_config.lora_config is not None
@@ -333,6 +344,8 @@ async def init_app_state(
     )
     lora_modules = process_lora_modules(args.lora_modules, default_mm_loras)
 
+    # 这些 serving helper 会被多个 router 共享，统一挂到 app.state 上，
+    # 避免每次请求都重新构建 tokenizer / model 元数据相关对象。
     state.openai_serving_models = OpenAIServingModels(
         engine_client=engine_client,
         base_model_paths=base_model_paths,
@@ -380,6 +393,7 @@ async def init_app_state(
 
 
 def create_server_socket(addr: tuple[str, int]) -> socket.socket:
+    """创建可复用的 TCP 监听 socket，后续交给 uvicorn 接管。"""
     family = socket.AF_INET
     if is_valid_ipv6_address(addr[0]):
         family = socket.AF_INET6
@@ -393,12 +407,14 @@ def create_server_socket(addr: tuple[str, int]) -> socket.socket:
 
 
 def create_server_unix_socket(path: str) -> socket.socket:
+    """为本地部署创建 Unix Domain Socket 监听端口。"""
     sock = socket.socket(family=socket.AF_UNIX, type=socket.SOCK_STREAM)
     sock.bind(path)
     return sock
 
 
 def validate_api_server_args(args):
+    """在 engine 启动前尽早校验 parser / plugin 参数是否合法。"""
     valid_tool_parses = ToolParserManager.list_registered()
     if args.enable_auto_tool_choice and args.tool_call_parser not in valid_tool_parses:
         raise KeyError(
@@ -418,8 +434,7 @@ def validate_api_server_args(args):
 
 @instrument(span_name="API server setup")
 def setup_server(args):
-    """Validate API server args, set up signal handler, create socket
-    ready to serve."""
+    """校验服务参数，设置信号处理，并提前创建好监听 socket。"""
 
     log_version_and_model(logger, VLLM_VERSION, args.model)
     log_non_default_args(args)
@@ -432,21 +447,19 @@ def setup_server(args):
 
     validate_api_server_args(args)
 
-    # workaround to make sure that we bind the port before the engine is set up.
-    # This avoids race conditions with ray.
-    # see https://github.com/vllm-project/vllm/issues/8204
+    # 先绑定端口，再初始化 engine，避免和 ray 相关的竞态问题。
+    # 见 https://github.com/vllm-project/vllm/issues/8204
     if args.uds:
         sock = create_server_unix_socket(args.uds)
     else:
         sock_addr = (args.host or "", args.port)
         sock = create_server_socket(sock_addr)
 
-    # workaround to avoid footguns where uvicorn drops requests with too
-    # many concurrent requests active
+    # 调整 ulimit，避免并发请求较多时 uvicorn 出现不符合预期的丢请求行为。
     set_ulimit()
 
     def signal_handler(*_) -> None:
-        # Interrupt server on sigterm while initializing
+        # 初始化阶段收到 SIGTERM 时，直接打断启动流程。
         raise KeyboardInterrupt("terminated")
 
     signal.signal(signal.SIGTERM, signal_handler)
@@ -462,9 +475,9 @@ def setup_server(args):
 
 
 async def run_server(args, **uvicorn_kwargs) -> None:
-    """Run a single-worker API server."""
+    """启动单 worker 的 API Server。"""
 
-    # Add process-specific prefix to stdout and stderr.
+    # 给当前进程的 stdout / stderr 打上前缀，方便区分日志来源。
     decorate_logs("APIServer")
 
     listen_address, sock = setup_server(args)
@@ -474,7 +487,7 @@ async def run_server(args, **uvicorn_kwargs) -> None:
 async def run_server_worker(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
-    """Run a single API server worker."""
+    """运行一个 API worker：创建 engine，组装 app，然后交给 uvicorn 提供服务。"""
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
@@ -482,7 +495,7 @@ async def run_server_worker(
     if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:
         ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)
 
-    # Get uvicorn log config (from file or with endpoint filter)
+    # 读取 uvicorn 日志配置，可能来自配置文件，也可能是按 endpoint 过滤后的默认配置。
     log_config = get_uvicorn_log_config(args)
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
@@ -491,6 +504,7 @@ async def run_server_worker(
         args,
         client_config=client_config,
     ) as engine_client:
+        # 先向后端确认当前模型 / 任务组合支持哪些能力，再按结果动态构建 app。
         supported_tasks = await engine_client.get_supported_tasks()
         logger.info("Supported tasks: %s", supported_tasks)
 
@@ -509,8 +523,7 @@ async def run_server_worker(
             host=args.host,
             port=args.port,
             log_level=args.uvicorn_log_level,
-            # NOTE: When the 'disable_uvicorn_access_log' value is True,
-            # no access log will be output.
+            # 当 disable_uvicorn_access_log=True 时，不输出 access log。
             access_log=not args.disable_uvicorn_access_log,
             timeout_keep_alive=envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE,
             ssl_keyfile=args.ssl_keyfile,
@@ -523,7 +536,7 @@ async def run_server_worker(
             **uvicorn_kwargs,
         )
 
-    # NB: Await server shutdown only after the backend context is exited
+    # 只有在 backend context 退出后，才等待 HTTP server 完成关闭。
     try:
         await shutdown_task
     finally:
@@ -531,9 +544,7 @@ async def run_server_worker(
 
 
 if __name__ == "__main__":
-    # NOTE(simon):
-    # This section should be in sync with vllm/entrypoints/cli/main.py for CLI
-    # entrypoints.
+    # 这里的 CLI 入口逻辑需要和 vllm/entrypoints/cli/main.py 保持一致。
     cli_env_setup()
     parser = FlexibleArgumentParser(
         description="vLLM OpenAI-Compatible RESTful API server."

@@ -57,10 +57,10 @@ logger = init_logger(__name__)
 
 
 class InputStreamError(Exception):
-    """Wrapper for errors from the input stream generator.
+    """包装输入流生成器抛出的异常。
 
-    This is used to propagate errors from the user's input generator
-    without wrapping them in EngineGenerateError.
+    这样 generate() 可以把用户输入流里的原始异常继续往上抛，
+    而不是统一包成 EngineGenerateError。
     """
 
     def __init__(self, cause: Exception):
@@ -69,7 +69,14 @@ class InputStreamError(Exception):
 
 
 class AsyncLLM(EngineClient):
-    """An asynchronous wrapper for the vLLM engine."""
+    """vLLM V1 运行时的异步前端封装。
+
+    可以把它理解成 API Server 和 EngineCore 之间的桥接层：
+    - 向上接收 chat/completion/embedding 等请求
+    - 在本进程里做输入预处理和输出整理
+    - 向下通过 EngineCoreClient 把请求发给真正的调度/执行核心
+    - 通过后台 output_handler 把 EngineCore 的输出回流给各请求队列
+    """
 
     def __init__(
         self,
@@ -87,27 +94,15 @@ class AsyncLLM(EngineClient):
         client_count: int = 1,
         client_index: int = 0,
     ) -> None:
-        """
-        Create an AsyncLLM.
+        """初始化 AsyncLLM。
 
-        Args:
-            vllm_config: global configuration.
-            executor_class: an Executor impl, e.g. MultiprocExecutor.
-            log_stats: Whether to log stats.
-            usage_context: Usage context of the LLM.
-            mm_registry: Multi-modal registry.
-            use_cached_outputs: Whether to use cached outputs.
-            log_requests: Whether to log requests.
-            start_engine_loop: Whether to start the engine loop.
-            stat_loggers: customized stat loggers for the engine.
-                If not provided, default stat loggers will be used.
-                PLEASE BE AWARE THAT STAT LOGGER IS NOT STABLE
-                IN V1, AND ITS BASE CLASS INTERFACE MIGHT CHANGE.
-
-        Returns:
-            None
+        这个类本身不负责真正的调度或模型执行，它主要负责 4 件事：
+        1. 维护 renderer / tokenizer / io_processor 等前端组件
+        2. 用 InputProcessor 把上层输入转成 EngineCoreRequest
+        3. 用 OutputProcessor 把 EngineCoreOutput 转成 RequestOutput
+        4. 通过 EngineCoreClient 与后端核心进程通信
         """
-        # Ensure we can serialize custom transformer configs
+        # 确保自定义 transformer config 可以跨进程序列化。
         maybe_register_config_serialize_by_value()
 
         self.vllm_config = vllm_config
@@ -132,6 +127,7 @@ class AsyncLLM(EngineClient):
                 "enabling logging without default stat loggers."
             )
 
+        # renderer 负责 prompt 渲染、tokenizer 获取等前端输入输出相关能力。
         self.renderer = renderer = renderer_from_config(self.vllm_config)
         self.io_processor = get_io_processor(
             self.vllm_config,
@@ -139,10 +135,10 @@ class AsyncLLM(EngineClient):
             self.model_config.io_processor_plugin,
         )
 
-        # Convert TokPrompt --> EngineCoreRequest.
+        # 把上层 prompt / sampling params 规范化成 EngineCoreRequest。
         self.input_processor = InputProcessor(self.vllm_config, renderer)
 
-        # Converts EngineCoreOutputs --> RequestOutput.
+        # 把后端核心进程返回的输出转成 API 层可消费的 RequestOutput。
         self.output_processor = OutputProcessor(
             renderer.tokenizer,
             log_stats=self.log_stats,
@@ -150,7 +146,7 @@ class AsyncLLM(EngineClient):
             tracing_enabled=tracing_endpoint is not None,
         )
 
-        # EngineCore (starts the engine in background process).
+        # 真正的调度与执行在 EngineCore 中完成；这里拿到的是它的异步 client。
         self.engine_core = EngineCoreClient.make_async_mp_client(
             vllm_config=vllm_config,
             executor_class=executor_class,
@@ -160,7 +156,7 @@ class AsyncLLM(EngineClient):
             client_index=client_index,
         )
 
-        # Loggers.
+        # 统计与指标日志管理器。
         self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
             self.logger_manager = StatLoggerManager(
@@ -177,7 +173,7 @@ class AsyncLLM(EngineClient):
 
         self.output_handler: asyncio.Task | None = None
         try:
-            # Start output handler eagerly if we are in the asyncio eventloop.
+            # 如果当前已经在事件循环中，就提前把后台输出循环拉起来。
             asyncio.get_running_loop()
             self._run_output_handler()
         except RuntimeError:
@@ -221,7 +217,7 @@ class AsyncLLM(EngineClient):
         client_count: int = 1,
         client_index: int = 0,
     ) -> "AsyncLLM":
-        # Create the LLMEngine.
+        # 根据配置选择合适的 Executor，再构建 AsyncLLM。
         return cls(
             vllm_config=vllm_config,
             executor_class=Executor.get_class(vllm_config),
@@ -244,13 +240,13 @@ class AsyncLLM(EngineClient):
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: list[StatLoggerFactory] | None = None,
     ) -> "AsyncLLM":
-        """Create an AsyncLLM from the EngineArgs."""
+        """根据 EngineArgs 构建 AsyncLLM。"""
 
-        # Create the engine configs.
+        # 先把命令行 / 外部参数转成内部统一配置。
         vllm_config = engine_args.create_engine_config(usage_context)
         executor_class = Executor.get_class(vllm_config)
 
-        # Create the AsyncLLM.
+        # 再创建前端异步 engine 封装。
         return cls(
             vllm_config=vllm_config,
             executor_class=executor_class,
@@ -265,7 +261,7 @@ class AsyncLLM(EngineClient):
         self.shutdown()
 
     def shutdown(self):
-        """Shutdown, cleaning up the background proc and IPC."""
+        """关闭 AsyncLLM，并清理后台进程、IPC 与本地任务。"""
 
         shutdown_prometheus()
 
@@ -281,7 +277,7 @@ class AsyncLLM(EngineClient):
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
-            # Cache the result
+            # 支持的任务类型由后端 engine 决定，这里只查询一次并缓存。
             self._supported_tasks = await self.engine_core.get_supported_tasks_async()
 
         return self._supported_tasks
@@ -303,7 +299,15 @@ class AsyncLLM(EngineClient):
         prompt_text: str | None = None,
         reasoning_ended: bool | None = None,
     ) -> RequestOutputCollector:
-        """Add new request to the AsyncLLM."""
+        """把一个新请求接入 AsyncLLM，并返回该请求对应的输出收集器。
+
+        这是 generate()/encode() 共同依赖的核心入口。主流程是：
+        1. 校验请求与参数
+        2. 把上层输入转成 EngineCoreRequest
+        3. 给请求分配内部 request_id
+        4. 在 OutputProcessor 中登记输出队列
+        5. 把请求发给 EngineCore
+        """
 
         if self.errored:
             raise EngineDeadError()
@@ -325,7 +329,7 @@ class AsyncLLM(EngineClient):
             if reasoning_ended is not None:
                 raise NotImplementedError
 
-            # Streaming input case.
+            # 输入本身是异步流时，走“边收输入边送后端”的特殊路径。
             return await self._add_streaming_input_request(
                 request_id,
                 prompt,
@@ -338,7 +342,7 @@ class AsyncLLM(EngineClient):
                 data_parallel_rank,
             )
 
-        # Convert Input --> Request.
+        # 普通请求会在这里被规范化成内部的 EngineCoreRequest。
         if isinstance(prompt, EngineCoreRequest):
             logger.warning_once(
                 "Passing EngineCoreRequest to AsyncLLM.generate() and .add_requests() "
@@ -371,17 +375,17 @@ class AsyncLLM(EngineClient):
         if reasoning_ended is not None:
             request.reasoning_ended = reasoning_ended
 
+        # 对外部 request_id 做内部标准化，保证整个运行时里是唯一、可追踪的。
         self.input_processor.assign_request_id(request)
 
-        # We start the output_handler on the first call to add_request() so
-        # we can call __init__ before the event loop, which enables us
-        # to handle startup failure gracefully in the OpenAI server.
+        # 后台输出循环延迟到第一次收请求时再启动，这样 AsyncLLM 可以在没有
+        # event loop 的上下文里被安全创建。
         self._run_output_handler()
 
-        # Create a new output collector for the request.
+        # 每个请求都有自己独立的输出收集队列，generate()/encode() 就从这里取结果。
         queue = RequestOutputCollector(params.output_kind, request.request_id)
 
-        # Use cloned params that may have been updated in process_inputs()
+        # process_inputs() 可能会克隆或修正参数，这里以后续版本为准。
         params = request.params
 
         if is_pooling or params.n == 1:
@@ -391,7 +395,7 @@ class AsyncLLM(EngineClient):
         parent_params = params
         assert isinstance(parent_params, SamplingParams)
 
-        # Fan out child requests (for n>1).
+        # n > 1 时，一个上层请求会拆成多个子请求并共享同一个父级 collector。
         parent_request = ParentRequest(request)
         for idx in range(parent_params.n):
             request_id, child_params = parent_request.get_child_info(idx)
@@ -411,10 +415,10 @@ class AsyncLLM(EngineClient):
         index: int,
         queue: RequestOutputCollector,
     ):
-        # Add the request to OutputProcessor (this process).
+        # 先在当前进程登记请求，建立 request_id -> queue 的映射关系。
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
-        # Add the EngineCoreRequest to EngineCore (separate process).
+        # 再把真正的 EngineCoreRequest 发给后端核心进程。
         await self.engine_core.add_request_async(request)
 
         if self.log_requests:
@@ -432,6 +436,11 @@ class AsyncLLM(EngineClient):
         priority: int = 0,
         data_parallel_rank: int | None = None,
     ) -> RequestOutputCollector:
+        """处理“输入本身就是异步流”的请求。
+
+        这条路径会启动一个本地协程，持续消费 input_stream，把每个输入片段
+        转成可恢复的请求增量并送往 EngineCore。
+        """
         self._validate_streaming_input_sampling_params(sampling_params)
 
         inputs = dict(
@@ -448,8 +457,8 @@ class AsyncLLM(EngineClient):
             sampling_params = sampling_params.clone()
             sampling_params.skip_clone = True
 
-        # Create request for validation, also used as the finished signal
-        # once the input stream is closed.
+        # 先构造一个“最终空请求”做参数校验；输入流结束时，还会用它作为
+        # “输入已经全部送完”的结束信号发给后端。
         final_req = self.input_processor.process_inputs(
             request_id=request_id,
             prompt=TokensPrompt(prompt_token_ids=[0]),
@@ -470,7 +479,7 @@ class AsyncLLM(EngineClient):
                         self._validate_streaming_input_sampling_params(sp)
                     else:
                         sp = sampling_params
-                    # TODO(nick): Avoid re-validating reused sampling parameters
+                    # TODO(nick): 避免对复用的 sampling_params 重复校验。
                     req = self.input_processor.process_inputs(
                         request_id=internal_req_id,
                         prompt=input_chunk.prompt,
@@ -490,17 +499,16 @@ class AsyncLLM(EngineClient):
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
-                # Wrap in InputStreamError so generate() can propagate it
-                # without wrapping in EngineGenerateError.
+                # 包一层 InputStreamError，让 generate() 能保留用户输入流的原始异常。
                 queue.put(InputStreamError(error))
             finally:
                 queue._input_stream_task = None
                 if not cancelled:
-                    # Send empty final request to indicate that inputs have
-                    # finished. Don't send if cancelled (session was aborted).
+                    # 发送一个空的 final request，告诉后端“输入流已经结束”。
+                    # 如果会话已经取消，则不再发送，避免多余状态推进。
                     await self._add_request(final_req, None, None, 0, queue)
 
-        # Ensure output handler is running.
+        # 输入流开始前，也要确保后台输出循环已经启动。
         self._run_output_handler()
 
         queue._input_stream_task = asyncio.create_task(handle_inputs())
@@ -510,6 +518,7 @@ class AsyncLLM(EngineClient):
     def _validate_streaming_input_sampling_params(
         params: SamplingParams | PoolingParams,
     ):
+        """校验输入流模式下允许使用的参数范围。"""
         if (
             not isinstance(params, SamplingParams)
             or params.n > 1
@@ -544,19 +553,13 @@ class AsyncLLM(EngineClient):
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
-        """
-        Main function called by the API server to kick off a request
-            * 1) Making an AsyncStream corresponding to the Request.
-            * 2) Processing the Input.
-            * 3) Adding the Request to the Detokenizer.
-            * 4) Adding the Request to the EngineCore (separate process).
+        """文本生成主入口。
 
-        A separate output_handler loop runs in a background AsyncIO task,
-        pulling outputs from EngineCore and putting them into the
-        per-request AsyncStream.
-
-        The caller of generate() iterates the returned AsyncGenerator,
-        returning the RequestOutput back to the caller.
+        API Server 最终会走到这里。执行顺序可以概括成：
+        1. 调用 add_request() 把请求送入 AsyncLLM
+        2. add_request() 再把请求登记到 OutputProcessor，并发给 EngineCore
+        3. 后台 _run_output_handler() 持续从 EngineCore 拉取输出
+        4. 当前协程从该请求对应的队列中取出 RequestOutput 并 yield 给上层
         """
 
         q: RequestOutputCollector | None = None
@@ -574,24 +577,19 @@ class AsyncLLM(EngineClient):
                 reasoning_ended=reasoning_ended,
             )
 
-            # The output_handler task pushes items into the queue.
-            # This task pulls from the queue and yields to caller.
+            # output_handler 负责往队列里塞数据；当前协程负责从队列里取数据返回给调用方。
             finished = False
             while not finished:
-                # Note: drain queue without await if possible (avoids
-                # task switching under load which helps performance).
+                # 优先无 await 地取数据，能少一次事件循环切换，对高并发路径更友好。
                 out = q.get_nowait() or await q.get()
 
-                # Note: both OutputProcessor and EngineCore handle their
-                # own request cleanup based on finished.
+                # 请求结束后的清理由 OutputProcessor 和 EngineCore 各自负责。
                 assert isinstance(out, RequestOutput)
                 finished = out.finished
                 if out is not STREAM_FINISHED:
                     yield out
 
-        # If the request is disconnected by the client, generate()
-        # is cancelled or the generator is garbage collected. So,
-        # we abort the request if we end up here.
+        # 客户端断开连接、协程被取消或生成器被回收时，需要主动中止后端请求。
         except (asyncio.CancelledError, GeneratorExit):
             if q is not None:
                 await self.abort(q.request_id, internal=True)
@@ -599,19 +597,19 @@ class AsyncLLM(EngineClient):
                 logger.info("Request %s aborted.", request_id)
             raise
 
-        # Engine is dead. Do not abort since we shut down.
+        # 后端已经挂掉时，不再重复 abort。
         except EngineDeadError:
             if self.log_requests:
                 logger.info("Request %s failed (engine dead).", request_id)
             raise
 
-        # Request validation error.
+        # 参数校验错误直接透传。
         except ValueError as e:
             if self.log_requests:
                 logger.info("Request %s failed (bad request): %s.", request_id, e)
             raise
 
-        # Error from input stream generator - propagate directly.
+        # 输入流里的原始异常直接继续向上抛。
         except InputStreamError as e:
             if q is not None:
                 await self.abort(q.request_id, internal=True)
@@ -619,7 +617,7 @@ class AsyncLLM(EngineClient):
                 logger.info("Request %s failed (input error): %s.", request_id, e)
             raise e.cause from e
 
-        # Unexpected error in the generate() task (possibly recoverable).
+        # 其余异常统一包装成 EngineGenerateError。
         except Exception as e:
             if q is not None:
                 await self.abort(q.request_id, internal=True)
@@ -639,19 +637,18 @@ class AsyncLLM(EngineClient):
                 q.close()
 
     def _run_output_handler(self):
-        """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
+        """启动后台输出循环，把 EngineCore 的输出分发回各请求队列。"""
 
         if self.output_handler is not None:
             return
 
-        # Ensure that the task doesn't have a circular ref back to the AsyncLLM
-        # object, or else it won't be garbage collected and cleaned up properly.
+        # 下面把成员引用拆出来，是为了避免 task 闭包反向持有 self，
+        # 导致 AsyncLLM 无法及时被 GC。
         engine_core = self.engine_core
         output_processor = self.output_processor
         log_stats = self.log_stats
-        # We use a mutable list for logger_manager so that it can be updated
-        # during elastic EP scaling (see scale_elastic_ep) without creating
-        # a circular reference via self.
+        # logger_manager 用可变 list 包一层，这样 elastic scaling 后可以替换，
+        # 同时又不必让闭包直接引用 self。
         self._logger_ref = [self.logger_manager]
         logger_ref = self._logger_ref
         renderer = self.renderer
@@ -660,7 +657,7 @@ class AsyncLLM(EngineClient):
         async def output_handler():
             try:
                 while True:
-                    # 1) Pull EngineCoreOutputs from the EngineCore.
+                    # 1. 从后端核心进程拉取这一轮完成的输出。
                     outputs = await engine_core.get_output_async()
                     num_outputs = len(outputs.outputs)
 
@@ -668,25 +665,23 @@ class AsyncLLM(EngineClient):
                         IterationStats() if (log_stats and num_outputs) else None
                     )
 
-                    # Split outputs into chunks of at most
-                    # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
-                    # event loop for too long.
+                    # 把大批量输出切成小块处理，避免单次处理占用事件循环太久。
                     engine_core_outputs = outputs.outputs
                     for start in range(0, num_outputs, chunk_size):
                         end = start + chunk_size
                         outputs_slice = engine_core_outputs[start:end]
-                        # 2) Process EngineCoreOutputs.
+                        # 2. 把 EngineCoreOutput 转成 RequestOutput，并分发到对应请求队列。
                         processed_outputs = output_processor.process_outputs(
                             outputs_slice, outputs.timestamp, iteration_stats
                         )
-                        # NOTE: RequestOutputs are pushed to their queues.
+                        # RequestOutput 在 process_outputs() 内部已经被推入对应 queue。
                         assert not processed_outputs.request_outputs
 
-                        # Allow other asyncio tasks to run between chunks
+                        # 在分块之间让出控制权，避免长时间阻塞其他 asyncio 任务。
                         if end < num_outputs:
                             await asyncio.sleep(0)
 
-                        # 3) Abort any reqs that finished due to stop strings.
+                        # 3. 某些请求可能因为 stop string 命中而需要回头通知后端 abort。
                         if processed_outputs.reqs_to_abort:
                             await engine_core.abort_requests_async(
                                 processed_outputs.reqs_to_abort
@@ -694,9 +689,8 @@ class AsyncLLM(EngineClient):
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
 
-                    # 4) Logging.
-                    # TODO(rob): make into a coroutine and launch it in
-                    # background thread once Prometheus overhead is non-trivial.
+                    # 4. 记录调度/迭代统计信息。
+                    # TODO(rob): Prometheus 开销变大后，再考虑搬到后台线程。
                     if logger_ref[0]:
                         logger_ref[0].record(
                             engine_idx=outputs.engine_index,
@@ -706,6 +700,7 @@ class AsyncLLM(EngineClient):
                         )
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
+                # 让所有等待该请求输出的调用方都能感知到这个后台错误。
                 output_processor.propagate_error(e)
 
         self.output_handler = asyncio.create_task(output_handler())
@@ -713,7 +708,7 @@ class AsyncLLM(EngineClient):
     async def abort(
         self, request_id: str | Iterable[str], internal: bool = False
     ) -> None:
-        """Abort RequestId in OutputProcessor and EngineCore."""
+        """同时在 OutputProcessor 和 EngineCore 中中止请求。"""
 
         request_ids = (
             (request_id,) if isinstance(request_id, str) else as_list(request_id)
@@ -731,23 +726,10 @@ class AsyncLLM(EngineClient):
         wait_for_inflight_requests: bool | None = None,
         clear_cache: bool = True,
     ) -> None:
-        """
-        Pause generation to allow model weight updates.
+        """暂停调度，常用于更新权重或做运行时切换。
 
-        All mode handling (abort / wait / keep) and cache clearing is done
-        in the engine. New generation/encoding requests will not be scheduled
-        until resume is called.
-
-        Args:
-            mode: How to handle in-flight requests:
-                - ``"abort"``: Abort all in-flight requests immediately
-                  (default).
-                - ``"wait"``: Wait for in-flight requests to complete.
-                - ``"keep"``: Freeze requests in queue; they resume on
-                  :meth:`resume_generation`.
-            wait_for_inflight_requests: DEPRECATED: use mode argument.
-            clear_cache: Whether to clear KV cache and prefix cache after
-                draining. Set to ``False`` to preserve cache for faster resume.
+        真正的暂停/排空/保留队列逻辑都在 EngineCore 里完成。暂停期间，
+        新的 generate/encode 请求不会继续被调度执行。
         """
         if wait_for_inflight_requests:
             warnings.warn(
@@ -759,20 +741,16 @@ class AsyncLLM(EngineClient):
             )
             mode = "wait"
         await self.engine_core.pause_scheduler_async(mode=mode, clear_cache=clear_cache)
-        # Small sleep to help ensure that final outputs from any in-flight requests are
-        # returned prior to this method returning. These outputs come out of the engine
-        # prior to the wait-for-idle completion event, but involve additional async
-        # tasks in output processing.
-        # Note that this is not required for correctness, just more intuitive ordering
-        # of events from caller's pov.
+        # 稍微 sleep 一下，让“已经在路上的最后一批输出”有机会先经过 output_handler
+        # 回到调用方，避免从调用者视角看起来事件顺序很奇怪。
         await asyncio.sleep(0.02)
 
     async def resume_generation(self) -> None:
-        """Resume generation after :meth:`pause_generation`."""
+        """恢复暂停后的调度执行。"""
         await self.engine_core.resume_scheduler_async()
 
     async def is_paused(self) -> bool:
-        """Return whether the engine is currently paused."""
+        """返回当前调度器是否处于暂停状态。"""
         return await self.engine_core.is_scheduler_paused_async()
 
     async def encode(
@@ -786,18 +764,10 @@ class AsyncLLM(EngineClient):
         tokenization_kwargs: dict[str, Any] | None = None,
         reasoning_ended: bool | None = None,
     ) -> AsyncGenerator[PoolingRequestOutput, None]:
-        """
-        Main function called by the API server to kick off a request
-            * 1) Making an AsyncStream corresponding to the Request.
-            * 2) Processing the Input.
-            * 3) Adding the Request to the EngineCore (separate process).
+        """pooling/embedding 主入口。
 
-        A separate output_handler loop runs in a background AsyncIO task,
-        pulling outputs from EngineCore and putting them into the
-        per-request AsyncStream.
-
-        The caller of generate() iterates the returned AsyncGenerator,
-        returning the RequestOutput back to the caller.
+        它和 generate() 的整体结构基本一致，只是输出类型换成了
+        PoolingRequestOutput。
         """
 
         q: RequestOutputCollector | None = None
@@ -813,21 +783,17 @@ class AsyncLLM(EngineClient):
                 reasoning_ended=reasoning_ended,
             )
 
-            # The output_handler task pushes items into the queue.
-            # This task pulls from the queue and yields to caller.
+            # output_handler 写队列，这里读队列并把 pooling 结果返回给调用方。
             finished = False
             while not finished:
-                # Note: drain queue without await if possible (avoids
-                # task switching under load which helps performance).
+                # 同样优先走无 await 的快路径。
                 out = q.get_nowait() or await q.get()
                 assert isinstance(out, PoolingRequestOutput)
-                # Note: both OutputProcessor and EngineCore handle their
-                # own request cleanup based on finished.
+                # 请求结束后的状态清理由 OutputProcessor / EngineCore 各自处理。
                 finished = out.finished
                 yield out
 
-        # If the request is disconnected by the client, generate()
-        # is cancelled. So, we abort the request if we end up here.
+        # 如果调用方取消，就中止后端请求。
         except asyncio.CancelledError:
             if q is not None:
                 await self.abort(q.request_id, internal=True)
@@ -835,19 +801,19 @@ class AsyncLLM(EngineClient):
                 logger.info("Request %s aborted.", request_id)
             raise
 
-        # Engine is dead. Do not abort since we shut down.
+        # 后端挂掉时不再重复 abort。
         except EngineDeadError:
             if self.log_requests:
                 logger.info("Request %s failed (engine dead).", request_id)
             raise
 
-        # Request validation error.
+        # 参数校验错误直接透传。
         except ValueError:
             if self.log_requests:
                 logger.info("Request %s failed (bad request).", request_id)
             raise
 
-        # Unexpected error in the generate() task (possibly recoverable).
+        # 其余异常统一包装成 EngineGenerateError。
         except Exception as e:
             if q is not None:
                 await self.abort(q.request_id, internal=True)
@@ -919,19 +885,19 @@ class AsyncLLM(EngineClient):
         return await self.engine_core.is_sleeping_async()
 
     async def add_lora(self, lora_request: LoRARequest) -> bool:
-        """Load a new LoRA adapter into the engine for future requests."""
+        """向后端 engine 动态加载一个新的 LoRA 适配器。"""
         return await self.engine_core.add_lora_async(lora_request)
 
     async def remove_lora(self, lora_id: int) -> bool:
-        """Remove an already loaded LoRA adapter."""
+        """卸载一个已经加载的 LoRA 适配器。"""
         return await self.engine_core.remove_lora_async(lora_id)
 
     async def list_loras(self) -> set[int]:
-        """List all registered adapters."""
+        """列出当前已注册的 LoRA 适配器。"""
         return await self.engine_core.list_loras_async()
 
     async def pin_lora(self, lora_id: int) -> bool:
-        """Prevent an adapter from being evicted."""
+        """把指定 LoRA 标记为不可驱逐。"""
         return await self.engine_core.pin_lora_async(lora_id)
 
     async def collective_rpc(
@@ -941,15 +907,13 @@ class AsyncLLM(EngineClient):
         args: tuple = (),
         kwargs: dict | None = None,
     ):
-        """
-        Perform a collective RPC call to the given path.
-        """
+        """向所有相关 engine worker 发起一次集体 RPC。"""
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs
         )
 
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
-        """Wait for all requests to be drained."""
+        """等待当前所有请求自然排空。"""
         start_time = time.time()
         while time.time() - start_time < drain_timeout:
             if not self.engine_core.dp_engines_running():
@@ -957,7 +921,7 @@ class AsyncLLM(EngineClient):
                 return
 
             logger.info("Engines are still running, waiting for requests to drain...")
-            await asyncio.sleep(1)  # Wait 1 second before checking again
+            await asyncio.sleep(1)  # 每秒轮询一次空闲状态
 
         raise TimeoutError(
             f"Timeout reached after {drain_timeout} seconds "
@@ -967,13 +931,10 @@ class AsyncLLM(EngineClient):
     async def scale_elastic_ep(
         self, new_data_parallel_size: int, drain_timeout: int = 300
     ):
-        """
-        Scale up or down the data parallel size by adding or removing
-        engine cores.
-        Args:
-            new_data_parallel_size: The new number of data parallel workers
-            drain_timeout:
-                Maximum time to wait for requests to drain (seconds)
+        """弹性调整 data parallel 大小。
+
+        本质上是增加或减少后端 engine core 的数量。必要时会先等现有请求排空，
+        再更新统计组件和 EngineCore 的并行规模。
         """
         old_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
         if old_data_parallel_size == new_data_parallel_size:
@@ -990,7 +951,7 @@ class AsyncLLM(EngineClient):
             )
             await self.wait_for_requests_to_drain(drain_timeout)
 
-        # recreate stat loggers
+        # 扩容时需要重建 stat logger，让新 engine rank 也能被纳入统计。
         if new_data_parallel_size > old_data_parallel_size and self.log_stats:
             # TODO(rob): fix this after talking with Ray team.
             # This resets all the prometheus metrics since we
@@ -1001,8 +962,7 @@ class AsyncLLM(EngineClient):
                 engine_idxs=list(range(new_data_parallel_size)),
                 custom_stat_loggers=None,
             )
-            # Update the mutable ref so output_handler picks up the
-            # new logger without creating a circular reference via self.
+            # 更新可变引用，让 output_handler 能感知到新的 logger_manager。
             if hasattr(self, "_logger_ref"):
                 self._logger_ref[0] = self.logger_manager
             self.logger_manager.log_engine_initialized()
@@ -1016,7 +976,7 @@ class AsyncLLM(EngineClient):
 
     @property
     def is_running(self) -> bool:
-        # Is None before the loop is started.
+        # output_handler 在首次收请求前可能还是 None，此时也认为是“可运行”状态。
         return self.output_handler is None or not self.output_handler.done()
 
     @property
@@ -1034,12 +994,7 @@ class AsyncLLM(EngineClient):
     async def init_weight_transfer_engine(
         self, request: WeightTransferInitRequest
     ) -> None:
-        """
-        Initialize weight transfer for RL training.
-
-        Args:
-            request: Weight transfer initialization request with backend-specific info
-        """
+        """为 RL 训练场景初始化权重传输引擎。"""
         from vllm.distributed.weight_transfer.base import (
             WeightTransferInitRequest,
         )
@@ -1054,12 +1009,7 @@ class AsyncLLM(EngineClient):
         )
 
     async def update_weights(self, request: WeightTransferUpdateRequest) -> None:
-        """
-        Batched weight update for RL training.
-
-        Args:
-            request: Weight update request with backend-specific update info
-        """
+        """为 RL 训练场景执行一次批量权重更新。"""
 
         if isinstance(request, WeightTransferUpdateRequest):
             update_info_dict = request.update_info
