@@ -62,6 +62,14 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
 
+# 这个文件实现的是前端引擎和 EngineCore 之间的“客户端层”。
+# 上层只关心 add_request / get_output / abort / utility RPC；
+# 至于底层是：
+# 1. 进程内直接调用 EngineCore，
+# 2. 还是通过 ZMQ 和后台 EngineCore 进程通信，
+# 3. 以及 DP 场景下如何在多个 EngineCore 之间路由，
+# 都由这里的不同 Client 实现统一封装。
+
 
 class EngineCoreClient(ABC):
     """
@@ -74,6 +82,29 @@ class EngineCoreClient(ABC):
     * AsyncMPClient: ZMQ + background proc EngineCore w/ asyncio (for AsyncLLM)
     """
 
+    # 先看这一层的职责边界：
+    # - 上层统一只调用 EngineCoreClient 暴露的接口；
+    # - 具体是“直接调本进程内的 EngineCore”，还是“通过 ZMQ 跟后台进程通信”，
+    #   以及是否要处理 asyncio / data parallel，都由子类决定。
+    #
+    # 几个主要实现的区别可以按下面这条线理解：
+    # - InprocClient:
+    #   EngineCore 就在当前进程，没有后台 busy loop，也不走 ZMQ。
+    #   add_request()/get_output() 本质是直接调 EngineCore 方法；
+    #   get_output() 会主动 step 一次后端。
+    # - SyncMPClient:
+    #   EngineCore 在独立进程里跑 busy loop，前端通过 ZMQ 发请求。
+    #   额外起一个后台线程持续收输出，再由同步的 get_output() 阻塞读取。
+    # - AsyncMPClient:
+    #   和 SyncMPClient 的进程/通信模型相同，但前端接口改成 asyncio，
+    #   输出接收从线程改成 asyncio task，给 AsyncLLM 使用。
+    # - DPAsyncMPClient:
+    #   在 AsyncMPClient 之上补 data parallel 状态管理，能感知多个
+    #   EngineCore、wave 和运行状态；但默认不负责复杂的内部负载均衡。
+    # - DPLBAsyncMPClient:
+    #   在 DPAsyncMPClient 之上再加“内部负载均衡”，一个 client 会自己在
+    #   多个 DP engine 之间选路，并维护 abort 时需要的 request->engine 映射。
+
     @staticmethod
     def make_client(
         multiprocess_mode: bool,
@@ -82,6 +113,7 @@ class EngineCoreClient(ABC):
         executor_class: type[Executor],
         log_stats: bool,
     ) -> "EngineCoreClient":
+        # 统一入口：根据“是否多进程”“是否 asyncio”选择具体的 client 实现。
         # TODO: support this for debugging purposes.
         if asyncio_mode and not multiprocess_mode:
             raise NotImplementedError(
@@ -109,6 +141,8 @@ class EngineCoreClient(ABC):
         client_count: int = 1,
         client_index: int = 0,
     ) -> "AsyncMPClient":
+        # AsyncLLM 默认走这里。若开启 DP，则继续根据“外部 LB / 内部 LB”
+        # 选择不同的多进程异步客户端。
         parallel_config = vllm_config.parallel_config
         client_args = (
             vllm_config,
@@ -269,6 +303,10 @@ class EngineCoreClient(ABC):
 
 
 class InprocClient(EngineCoreClient):
+    # 最简单的一种模式：EngineCore 和前端在同一进程里，不走 ZMQ。
+    # 常用于同步版 LLMEngine，前端通过直接函数调用推进调度与执行。
+    # 和另外几个 MP client 的最大区别是：这里没有后台 EngineCore 进程，
+    # 所以 get_output() 不是“收后台推回来的结果”，而是“当前线程主动 step”。
     """
     InprocClient: client for in-process EngineCore. Intended
     for use in LLMEngine for V0-style add_request() and step()
@@ -282,6 +320,7 @@ class InprocClient(EngineCoreClient):
         self.engine_core = EngineCore(*args, **kwargs)
 
     def get_output(self) -> EngineCoreOutputs:
+        # 进程内模式下，没有后台输出线程；直接 step 一次拿这一轮输出。
         outputs, model_executed = self.engine_core.step_fn()
         self.engine_core.post_step(model_executed=model_executed)
         return outputs and outputs.get(0) or EngineCoreOutputs()
@@ -290,6 +329,7 @@ class InprocClient(EngineCoreClient):
         return self.engine_core.get_supported_tasks()
 
     def add_request(self, request: EngineCoreRequest) -> None:
+        # 先做一次前处理，再真正塞进 EngineCore 内部调度器。
         req, request_wave = self.engine_core.preprocess_add_request(request)
         self.engine_core.add_request(req, request_wave)
 
@@ -363,6 +403,8 @@ class InprocClient(EngineCoreClient):
 
 @dataclass
 class BackgroundResources:
+    # 把需要在 shutdown / GC 时统一回收的后台资源集中放在这里，
+    # 避免线程、task、socket 反向持有 client，导致对象难以释放。
     """Used as a finalizer for clean shutdown, avoiding
     circular reference back to the client object."""
 
@@ -394,7 +436,8 @@ class BackgroundResources:
             self.coordinator.close()
 
         if isinstance(self.output_socket, zmq.asyncio.Socket):
-            # Async case.
+            # Async 模式下，socket / task 可能归属于某个事件循环，
+            # 关闭时要尽量在对应 loop 里完成，避免跨线程关闭出错。
             loop = self.output_queue_task._loop if self.output_queue_task else None
 
             sockets = (
@@ -427,7 +470,8 @@ class BackgroundResources:
                 del self.output_queue_task
                 del self.stats_update_task
         else:
-            # Sync case.
+            # Sync 模式下，输出线程会阻塞在 socket 上，需要额外发一个
+            # shutdown 信号把它唤醒，才能干净退出。
 
             # ZMQ context termination can hang if the sockets
             # aren't explicitly closed first.
@@ -505,6 +549,12 @@ def allocate_stateless_group_ports(parallel_config, new_data_parallel_size: int)
 
 
 class MPClient(EngineCoreClient):
+    # 多进程模式的公共基类。
+    # 前端进程通过 input_socket 把请求发给后台 EngineCore 进程，
+    # 再通过 output_socket 收 EngineCoreOutputs / utility 返回值。
+    # 和 InprocClient 相比，核心差异是：
+    # - EngineCore 被放到独立进程里持续跑 busy loop；
+    # - 前端不再直接调用 EngineCore 方法，而是统一封装成消息收发。
     """
     MPClient: base client for multi-proc EngineCore.
         EngineCore runs in a background process busy loop, getting
@@ -526,11 +576,12 @@ class MPClient(EngineCoreClient):
         client_addresses: dict[str, str] | None = None,
     ):
         self.vllm_config = vllm_config
-        # Serialization setup.
+        # 使用 msgpack 做控制消息序列化；张量底层 buffer 会通过
+        # ZMQ multipart 零拷贝路径一起传过去。
         self.encoder = MsgpackEncoder()
         self.decoder = MsgpackDecoder(EngineCoreOutputs)
 
-        # ZMQ setup.
+        # 建立和 EngineCore 通信所需的 ZMQ context / socket。
         sync_ctx = zmq.Context(io_threads=2)
         self.ctx = zmq.asyncio.Context(sync_ctx) if asyncio_mode else sync_ctx
 
@@ -546,7 +597,7 @@ class MPClient(EngineCoreClient):
 
             self.stats_update_address: str | None = None
             if client_addresses:
-                # Engines are managed externally to this client.
+                # 外部已经把 EngineCore 拉起来了；这里只负责连上去。
                 input_address = client_addresses["input_address"]
                 output_address = client_addresses["output_address"]
                 self.stats_update_address = client_addresses.get("stats_update_address")
@@ -557,7 +608,7 @@ class MPClient(EngineCoreClient):
                     self.ctx, output_address, zmq.PULL
                 )
             else:
-                # Engines are managed by this client.
+                # 当前 client 自己负责拉起本地 / 远端 EngineCore。
                 addresses = get_engine_zmq_addresses(vllm_config)
                 self.input_socket = self.resources.input_socket = make_zmq_socket(
                     self.ctx, addresses.inputs[0], zmq.ROUTER, bind=True
@@ -601,7 +652,8 @@ class MPClient(EngineCoreClient):
                 rank.to_bytes(2, "little") for rank in self.engine_ranks_managed
             ]
 
-            # Wait for ready messages from each engine on the input socket.
+            # 等待每个 EngineCore 发 ready，确保权重加载和后台循环至少已经
+            # 进入可通信状态，前端再开始收发请求。
             identities = set(self.core_engines)
             sync_input_socket = zmq.Socket.shadow(self.input_socket)
             while identities:
@@ -623,9 +675,8 @@ class MPClient(EngineCoreClient):
             self.core_engine: EngineIdentity = self.core_engines[0]
             self.utility_results: dict[int, AnyFuture] = {}
 
-            # Request objects which may contain pytorch-allocated tensors
-            # that we need to keep references to until zmq is done with the
-            # underlying data.
+            # 某些请求里带有 tensor backing buffer。ZMQ 发送尚未完成前，
+            # 这里要保留原对象引用，避免底层内存被过早释放。
             self.pending_messages = deque[tuple[zmq.MessageTracker, Any]]()
 
             # Start monitoring engine core processes for unexpected failures
@@ -662,7 +713,7 @@ class MPClient(EngineCoreClient):
         return self.engines_running
 
     def start_engine_core_monitor(self):
-        """Start a monitor thread for engine core processes."""
+        """启动一个守护线程监控后台 EngineCore 进程是否意外退出。"""
         engine_manager = self.resources.engine_manager
         if (
             engine_manager is None
@@ -705,6 +756,9 @@ class MPClient(EngineCoreClient):
 def _process_utility_output(
     output: UtilityOutput, utility_results: dict[int, AnyFuture]
 ):
+    # utility 调用指的是“不是推理请求本身”的 RPC，例如：
+    # get_supported_tasks / reset_cache / add_lora / sleep 等。
+    # 这些调用会在前端创建一个 future，收到返回值后在这里回填结果。
     """Set the result from a utility method in the waiting future."""
     future = utility_results.pop(output.call_id)
     failure_message = output.failure_message
@@ -725,6 +779,11 @@ def _process_utility_output(
 
 
 class SyncMPClient(MPClient):
+    # 给同步调用栈用的多进程 client。它会起一个后台线程专门收输出，
+    # 主线程通过阻塞 get_output() 读取已经转发到 queue 里的结果。
+    # 所以它和 InprocClient 同样暴露同步接口，但同步方式不同：
+    # - InprocClient: 当前线程自己推进 EngineCore.step()
+    # - SyncMPClient: 当前线程阻塞等待后台进程/后台线程送来结果
     """Synchronous client for multi-proc EngineCore."""
 
     @instrument(span_name="SyncMPClient init")
@@ -769,6 +828,8 @@ class SyncMPClient(MPClient):
                         # shutdown signal, exit thread.
                         break
 
+                    # EngineCore 的所有输出都从 output socket 统一回来；
+                    # utility 输出和正常推理输出会在这里分流。
                     frames = out_socket.recv_multipart(copy=False)
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
@@ -896,6 +957,13 @@ class SyncMPClient(MPClient):
 
 
 class AsyncMPClient(MPClient):
+    # AsyncLLM 主要使用的实现。
+    # 它把 ZMQ 收发包装成 asyncio 风格接口，让上层可以 await
+    # add_request_async() / get_output_async() / utility_async()。
+    # 和 SyncMPClient 的本质区别不在于 EngineCore 部署方式，
+    # 而在于前端消费模型：
+    # - SyncMPClient 用后台线程 + queue.Queue
+    # - AsyncMPClient 用 asyncio task + asyncio.Queue
     """Asyncio-compatible client for multi-proc EngineCore."""
 
     @instrument(span_name="AsyncMPClient init")
@@ -934,8 +1002,9 @@ class AsyncMPClient(MPClient):
         if resources.output_queue_task is not None:
             return
 
-        # Perform IO in separate task to parallelize as much as possible.
-        # Avoid task having direct reference back to the client.
+        # 单独起一个 asyncio task 持续从 output socket 收消息。
+        # 这样上层 run_output_handler 不需要自己直接碰 ZMQ。
+        # 同时避免 task 闭包直接持有 self，减少循环引用。
         decoder = self.decoder
         utility_results = self.utility_results
         outputs_queue = self.outputs_queue
@@ -953,10 +1022,14 @@ class AsyncMPClient(MPClient):
         async def process_outputs_socket():
             try:
                 while True:
+                    # 后台 EngineCore 每完成一批调度，就会把结果通过 ZMQ
+                    # 发回来；这里负责接收并解码。
                     frames = await output_socket.recv_multipart(copy=False)
                     resources.validate_alive(frames)
                     outputs: EngineCoreOutputs = decoder.decode(frames)
                     if outputs.utility_output:
+                        # utility 返回值不走普通输出队列，而是直接回填到
+                        # 对应 call_id 的 future 上。
                         if (
                             outputs.utility_output.call_id == EEP_NOTIFICATION_CALL_ID
                             and notification_callback_handler is not None
@@ -980,6 +1053,8 @@ class AsyncMPClient(MPClient):
                         continue
 
                     if output_handler is not None:
+                        # DP/LB 子类可以在这里对输出做额外 bookkeeping，
+                        # 例如清理“某请求当前在哪个 engine 上执行”的映射。
                         assert _self_ref is not None
                         _self = _self_ref()
                         if not _self:
@@ -988,6 +1063,7 @@ class AsyncMPClient(MPClient):
                         await output_handler(_self, outputs)
 
                     if outputs.outputs or outputs.scheduler_stats:
+                        # 真正的推理输出会再转发给 AsyncLLM 的后台 output handler。
                         outputs_queue.put_nowait(outputs)
             except Exception as e:
                 outputs_queue.put_nowait(e)
@@ -1000,6 +1076,8 @@ class AsyncMPClient(MPClient):
 
     async def get_output_async(self) -> EngineCoreOutputs:
         self._ensure_output_queue_task()
+        # AsyncLLM 的 _run_output_handler() 就是在 await 这里，
+        # 拿到一批 EngineCoreOutputs 后再交给 OutputProcessor。
         # If an exception arises in process_outputs_socket task,
         # it is forwarded to the outputs_queue so we can raise it
         # from this (run_output_handler) task to shut down the server.
@@ -1028,6 +1106,8 @@ class AsyncMPClient(MPClient):
         objects is a reference to retain until zmq is finished with the
         buffers, in case they were extracted from tensors in the request.
         """
+        # 所有发往 EngineCore 的控制消息最终都走这里：
+        # (engine_identity, request_type, serialized_payload...)
         self.ensure_alive()
         self.free_pending_messages()
 
@@ -1052,6 +1132,8 @@ class AsyncMPClient(MPClient):
     async def _call_utility_async(
         self, method: str, *args, engine: EngineIdentity
     ) -> Any:
+        # utility 调用本质上也是一次消息往返，只不过它不是 ADD/ABORT，
+        # 而是让 EngineCore 在后台执行一个辅助方法，并异步回结果。
         call_id = uuid.uuid1().int >> 64
         future = asyncio.get_running_loop().create_future()
         self.utility_results[call_id] = future
@@ -1146,6 +1228,13 @@ class AsyncMPClient(MPClient):
 
 
 class DPAsyncMPClient(AsyncMPClient):
+    # 数据并行场景下的异步 client 基类。
+    # 核心额外职责：
+    # 1. 订阅 coordinator 发来的 engine 负载统计；
+    # 2. 维护“当前 wave / engine 是否运行中”等状态；
+    # 3. 在发请求前决定把请求送到哪个 DP engine。
+    # 这里主要是“支持多个 engine 并维护状态”，并不一定自己做负载均衡；
+    # 外部 LB 场景下，经常是一类 client 只对应一个 DP rank。
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
     EngineCore. Assumes external load-balancing by default."""
 
@@ -1215,6 +1304,8 @@ class DPAsyncMPClient(AsyncMPClient):
                 poller.register(first_req_rcv_socket, zmq.POLLIN)
 
                 while True:
+                    # 一路收 coordinator 的统计广播，另一路收“首个请求”
+                    # 或 elastic scaling 的本地通知。
                     events = await poller.poll()
                     if (
                         not self.engines_running
@@ -1307,12 +1398,16 @@ class DPAsyncMPClient(AsyncMPClient):
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         self._ensure_stats_update_task()
 
+        # wave 用来和后端当前轮次对齐；LB 子类还会根据本地负载信息
+        # 选择一个具体 engine。
         request.current_wave = self.current_wave
         request.client_index = self.client_index
 
         chosen_engine = self.get_core_engine_for_request(request)
         to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
         if not self.engines_running:
+            # 当所有 engine 处于暂停态时，首个请求需要额外通知 coordinator，
+            # 让其把相关 engine 唤醒。
             # Notify coordinator that we're sending a request
             req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
             await self.first_req_send_socket.send(req_msg)
@@ -1326,6 +1421,12 @@ class DPAsyncMPClient(AsyncMPClient):
 
 
 class DPLBAsyncMPClient(DPAsyncMPClient):
+    # 内部负载均衡版 DP client。
+    # 一个前端 client 可以面向多个 DP engine，根据 waiting/running 计数
+    # 选择“当前最轻”的 engine 来路由请求。
+    # 所以它和 DPAsyncMPClient 的区别是：
+    # - DPAsyncMPClient 更偏“多 engine 状态感知 + 发送到某个既定 engine”
+    # - DPLBAsyncMPClient 额外承担“选哪台 engine”以及“abort 路由回哪台”的职责
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
     EngineCore. Load-balances between multiple engine processes."""
 
@@ -1377,6 +1478,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     eng_index = idx
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
+            # 这是一个本地乐观更新，避免在两次统计广播之间多个请求都扎堆
+            # 打到同一个 engine。
             current_counts[eng_index][0] += self.client_count
 
         chosen_engine = self.core_engines[eng_index]
@@ -1399,6 +1502,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
     ):
+        # 请求结束后，把“request_id -> engine” 的路由记录删掉，
+        # 这样后续 abort / 清理就不会再误发到旧 engine。
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 self.reqs_in_flight.pop(req_id, None)
@@ -1468,6 +1573,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         if not request_ids or self.resources.engine_dead:
             return
 
+        # LB 模式下 abort 不能随便广播，必须发到最初接收该请求的 engine。
         if len(request_ids) == 1:
             # Fast-path common case.
             if engine := self.reqs_in_flight.get(request_ids[0]):

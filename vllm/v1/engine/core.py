@@ -79,8 +79,22 @@ HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
+# 这个文件实现的是 vLLM V1 的“内核执行层”。
+# 可以把它分成三层来看：
+# 1. `EngineCore`：真正的调度与执行主循环，负责 scheduler + executor。
+# 2. `EngineCoreProc`：把 `EngineCore` 包成后台进程，通过 ZMQ 和前端通信。
+# 3. `DPEngineCoreProc`：在 `EngineCoreProc` 之上补齐 DP/MoE 场景下的 wave 协同、
+#    负载统计和 elastic scaling 逻辑。
+
 
 class EngineCore:
+    # `EngineCore` 是 V1 引擎真正“干活”的地方。
+    # 上层 client 只负责把请求送进来、把输出取回去；
+    # 这里负责：
+    # 1. 初始化模型执行器与 KV cache
+    # 2. 构造 scheduler
+    # 3. 每轮 schedule -> execute -> update_from_output
+    # 4. 管理缓存、LoRA、sleep/wake、structured output 等运行时能力
     """Inner loop of vLLM's Engine."""
 
     def __init__(
@@ -106,7 +120,7 @@ class EngineCore:
 
         self.log_stats = log_stats
 
-        # Setup Model.
+        # 先创建真正负责模型前向执行的 executor。
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
@@ -116,7 +130,7 @@ class EngineCore:
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self._eep_scale_up_before_kv_init()
 
-        # Setup KV Caches and update CacheConfig after profiling.
+        # 基于模型 profile 结果初始化 KV cache，并把最终 block 数同步回配置。
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
             vllm_config
         )
@@ -127,7 +141,7 @@ class EngineCore:
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
-        # Setup scheduler.
+        # scheduler 负责请求队列、batch 组装、block 分配、状态推进等逻辑。
         Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
 
         if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
@@ -181,10 +195,8 @@ class EngineCore:
                         content.update(worker_dict)
                 kv_connector.set_xfer_handshake_metadata(content)
 
-        # Setup batch queue for pipeline parallelism.
-        # Batch queue for scheduled batches. This enables us to asynchronously
-        # schedule and execute batches, and is required by pipeline parallelism
-        # to eliminate pipeline bubbles.
+        # pipeline parallel 场景下，允许“调度下一批”和“等待上一批执行结果”
+        # 交叠进行，减少 pipeline bubble。
         self.batch_queue_size = self.model_executor.max_concurrent_batches
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
@@ -210,11 +222,14 @@ class EngineCore:
                 scheduler_block_size, caching_hash_fn
             )
 
+        # 根据是否启用 batch queue，选择主循环里调用的 step 实现。
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
+        # socket 线程收到 abort 后会优先放入这里，主循环会在一次 forward
+        # 结束后统一批量处理。
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
@@ -234,7 +249,7 @@ class EngineCore:
     ) -> tuple[int, int, KVCacheConfig]:
         start = time.time()
 
-        # Get all kv cache needed by the model
+        # 先让 executor 告诉我们模型到底需要哪些 KV cache 规格。
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
@@ -247,8 +262,7 @@ class EngineCore:
                     kv_cache_specs
                 )
             else:
-                # Profiles the peak memory usage of the model to determine how
-                # much memory can be allocated for kv cache.
+                # 通过 profile 得到“模型本体最多吃多少显存”，剩余部分才能分给 KV cache。
                 available_gpu_memory = self.model_executor.determine_available_memory()
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
@@ -257,7 +271,8 @@ class EngineCore:
 
         assert len(kv_cache_specs) == len(available_gpu_memory)
 
-        # Track max_model_len before KV cache config to detect auto-fit changes
+        # 生成 KV cache 配置时，auto-fit 逻辑可能会把 max_model_len 调小，
+        # 这里要把变化同步回所有 worker。
         max_model_len_before = vllm_config.model_config.max_model_len
 
         kv_cache_configs = get_kv_cache_configs(
@@ -275,7 +290,7 @@ class EngineCore:
         num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         num_cpu_blocks = 0
 
-        # Initialize kv cache and warmup the execution
+        # 真正创建 cache，并顺带完成一轮 warmup。
         self.model_executor.initialize_from_config(kv_cache_configs)
 
         elapsed = time.time() - start
@@ -301,6 +316,8 @@ class EngineCore:
                 f"request_id must be a string, got {type(request.request_id)}"
             )
 
+        # pooling 请求不是“正常生成少走几步”，而是单独的任务类型，
+        # 这里会先校验当前模型是否支持该 pooling task。
         if pooling_params := request.pooling_params:
             supported_pooling_tasks = [
                 task for task in self.get_supported_tasks() if task in POOLING_TASKS
@@ -320,6 +337,7 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+        # 从这里开始，请求正式交给 scheduler 持有和调度。
         self.scheduler.add_request(request)
 
     def abort_requests(self, request_ids: list[str]):
@@ -385,9 +403,12 @@ class EngineCore:
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
+        # 没有请求就不做任何事情。
         if not self.scheduler.has_requests():
             return {}, False
+        # 1. 先让 scheduler 决定这一轮跑哪些 request / token。
         scheduler_output = self.scheduler.schedule()
+        # 2. 交给 executor 执行模型前向。
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -396,10 +417,10 @@ class EngineCore:
         ):
             model_output = future.result()
             if model_output is None:
+                # 某些路径下 execute_model 只做前向，采样要在这里补上。
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
+        # 3. 先处理本轮执行期间收到的 abort，再推进 scheduler 状态。
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -437,9 +458,8 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
-        # Try to schedule a new batch if the batch queue is not full, but
-        # the scheduler may return an empty batch if all requests are scheduled.
-        # Note that this is not blocking.
+        # 这一版 step 主要给 pipeline parallel 用：
+        # 队列没满时优先继续发批次，队列满了或没法继续调度时再等结果。
         assert len(batch_queue) < self.batch_queue_size
 
         model_executed = False
@@ -453,6 +473,8 @@ class EngineCore:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
             if self.is_pooling_model or not model_executed:
+                # pooling 没有 sampler；或者本轮其实没有真正执行模型，
+                # 那就直接等 execute_model 的结果。
                 # No sampling required (no requests scheduled).
                 future = cast(Future[ModelRunnerOutput], exec_future)
             else:
@@ -478,6 +500,8 @@ class EngineCore:
                     and len(batch_queue) < self.batch_queue_size
                     and not batch_queue[-1][0].done()
                 ):
+                    # 只要还能继续把队列填满，就尽量不要阻塞等结果，
+                    # 这样吞吐更高。
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
                     return None, True
@@ -488,7 +512,7 @@ class EngineCore:
             # is non-empty.
             return None, False
 
-        # Block until the next result is available.
+        # 队列不能继续填了，就阻塞拿最早那个 batch 的结果。
         future, scheduler_output, exec_model_fut = batch_queue.pop()
         with (
             self.log_error_detail(scheduler_output),
@@ -501,8 +525,7 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
+        # 和普通 step 一样，先吃掉执行期间积累的 abort，再推进 scheduler。
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
@@ -535,6 +558,8 @@ class EngineCore:
         return engine_core_outputs, model_executed
 
     def _process_aborts_queue(self):
+        # socket 线程可能在模型执行时不断收到 abort。
+        # 这里把这一小段时间内的 abort 全部合并成一个批次，一次性处理。
         if not self.aborts_queue.empty():
             request_ids = []
             while not self.aborts_queue.empty():
@@ -741,11 +766,13 @@ class EngineCore:
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.
+        # 多模态场景下，先把接收到的 mm feature 和本地缓存状态对齐。
         if self.mm_receiver_cache is not None and request.mm_features:
             request.mm_features = self.mm_receiver_cache.get_and_update_features(
                 request.mm_features
             )
 
+        # 把前端传来的 EngineCoreRequest 转成 scheduler 真正使用的 Request。
         req = Request.from_engine_core_request(request, self.request_block_hasher)
         if req.use_structured_output:
             # Note on thread safety: no race condition.
@@ -768,6 +795,12 @@ class EngineCore:
 
 
 class EngineCoreProc(EngineCore):
+    # `EngineCoreProc` = `EngineCore` + 后台进程通信外壳。
+    # 它本身仍然继承 `EngineCore` 负责调度和执行；
+    # 额外增加：
+    # 1. 输入线程：把 ZMQ 消息解码后送入 input_queue
+    # 2. 输出线程：把 EngineCoreOutputs 从 output_queue 编码后发回前端
+    # 3. busy loop：消费 input_queue，并不断调用 step_fn()
     """ZMQ-wrapper for running EngineCore in background process."""
 
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
@@ -804,7 +837,8 @@ class EngineCoreProc(EngineCore):
         ) as addresses:
             self.client_count = len(addresses.outputs)
 
-            # Set up data parallel environment.
+            # 先通过握手拿到和前端/协调器通信所需的 ZMQ 地址，
+            # 再决定自己是不是运行在 DP 协调场景中。
             self.has_coordinator = addresses.coordinator_output is not None
             self.frontend_stats_publish_address = (
                 addresses.frontend_stats_publish_address
@@ -839,11 +873,9 @@ class EngineCoreProc(EngineCore):
                 internal_dp_balancing,
             )
 
-            # Background Threads and Queues for IO. These enable us to
-            # overlap ZMQ socket IO with GPU since they release the GIL,
-            # and to overlap some serialization/deserialization with the
-            # model forward pass.
-            # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
+            # IO 和核心调度主循环分线程：
+            # socket 线程负责 ZMQ <-> queue，主线程只处理 queue，
+            # 这样可以把网络 IO / 序列化 和 GPU 前向尽量并行起来。
             ready_event = threading.Event()
             input_thread = threading.Thread(
                 target=self.process_input_sockets,
@@ -989,7 +1021,8 @@ class EngineCoreProc(EngineCore):
         headless: bool,
         parallel_config: ParallelConfig | None = None,
     ) -> EngineZmqAddresses:
-        # Send registration message.
+        # 启动时先给前端发 HELLO，前端返回 input/output/coordinator 等地址，
+        # 后台进程之后就按这些地址建立真正的数据通道。
         handshake_socket.send(
             msgspec.msgpack.encode(
                 {
@@ -1079,9 +1112,11 @@ class EngineCoreProc(EngineCore):
             if data_parallel and vllm_config.model_config.is_moe:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
+                # MoE + DP 需要跨 rank 协同，所以走 DPEngineCoreProc。
                 engine_core = DPEngineCoreProc(*args, **kwargs)
             else:
-                # Non-MoE DP ranks are completely independent, so treat like DP=1.
+                # 非 MoE 的 DP rank 之间彼此独立，不需要 wave 协同，
+                # 所以直接按普通 EngineCoreProc 处理。
                 # Note that parallel_config.data_parallel_index will still reflect
                 # the original DP rank.
                 parallel_config.data_parallel_size = 1
@@ -1122,9 +1157,9 @@ class EngineCoreProc(EngineCore):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while True:
-            # 1) Poll the input queue until there is work to do.
+            # 1. 先把前端发来的请求吃进来，必要时阻塞等待工作。
             self._process_input_queue()
-            # 2) Step the engine core and return the outputs.
+            # 2. 再推进一轮 EngineCore，并把结果写回 output_queue。
             self._process_engine_step()
 
     def _process_input_queue(self):
@@ -1132,7 +1167,7 @@ class EngineCoreProc(EngineCore):
 
         waited = False
         while not self.has_work():
-            # Notify callbacks waiting for engine to become idle.
+            # 完全空闲时，先通知那些在等“引擎已空闲”的回调。
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():
                 # Drain aborts queue; all aborts are also processed via input_queue.
@@ -1153,7 +1188,8 @@ class EngineCoreProc(EngineCore):
         if waited:
             logger.debug("EngineCore loop active.")
 
-        # Handle any more client requests.
+        # 一旦准备进入 step，再顺手把当前队列里已经到达的请求全部清空，
+        # 这样本轮调度看到的状态更完整。
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
@@ -1161,9 +1197,9 @@ class EngineCoreProc(EngineCore):
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
-        # Step the engine core.
+        # 执行一次核心调度循环。
         outputs, model_executed = self.step_fn()
-        # Put EngineCoreOutputs into the output queue.
+        # 一个 step 里可能产生多个 client 的输出，逐个写入输出队列。
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
         # Post-step hook.
@@ -1189,11 +1225,15 @@ class EngineCoreProc(EngineCore):
         """Dispatch request from client."""
 
         if request_type == EngineCoreRequestType.ADD:
+            # ADD 请求在 socket 线程里已经完成了大部分反序列化和预处理，
+            # 这里直接交给 scheduler。
             req, request_wave = request
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
+            # utility 请求不是正常推理，而是调用 EngineCore 的辅助方法，
+            # 例如 reset_cache / add_lora / sleep / get_supported_tasks。
             client_idx, call_id, method_name, args = request
             output = UtilityOutput(call_id)
             # Lazily look-up utility method so that failure will be handled/returned.
@@ -1270,7 +1310,13 @@ class EngineCoreProc(EngineCore):
     ):
         """Input socket IO thread."""
 
-        # Msgpack serialization decoding.
+        # 这个线程专门负责：
+        # 1. 从前端 socket 收消息
+        # 2. 反序列化请求
+        # 3. 对 ADD 请求做预处理
+        # 4. 放入 input_queue 供主 busy loop 消费
+        #
+        # 这么做可以把部分 CPU 侧工作和 GPU 前向并行起来。
         add_request_decoder = MsgpackDecoder(EngineCoreRequest)
         generic_decoder = MsgpackDecoder()
 
@@ -1325,7 +1371,7 @@ class EngineCoreProc(EngineCore):
                         continue
                     request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 
-                    # Deserialize the request data.
+                    # 按 request type 做对应的反序列化和前处理。
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
@@ -1338,13 +1384,13 @@ class EngineCoreProc(EngineCore):
                         request = generic_decoder.decode(data_frames)
 
                         if request_type == EngineCoreRequestType.ABORT:
-                            # Aborts are added to *both* queues, allows us to eagerly
-                            # process aborts while also ensuring ordering in the input
-                            # queue to avoid leaking requests. This is ok because
-                            # aborting in the scheduler is idempotent.
+                            # abort 同时进两个队列：
+                            # 1. aborts_queue：让一次 forward 结束后尽快处理
+                            # 2. input_queue：保证和普通请求之间的时序关系
+                            # scheduler 的 abort 是幂等的，所以这样做没问题。
                             self.aborts_queue.put_nowait(request)
 
-                    # Push to input queue for core busy loop.
+                    # 统一交给主 busy loop 做最终分发。
                     self.input_queue.put_nowait((request_type, request))
 
     def process_output_sockets(
@@ -1355,7 +1401,10 @@ class EngineCoreProc(EngineCore):
     ):
         """Output socket IO thread."""
 
-        # Msgpack serialization encoding.
+        # 和输入线程相反，这里负责：
+        # 1. 从 output_queue 取 EngineCoreOutputs
+        # 2. 做序列化
+        # 3. 通过对应 socket 发回前端/协调器
         encoder = MsgpackEncoder()
         # Send buffers to reuse.
         reuse_buffers: list[bytearray] = []
@@ -1395,6 +1444,7 @@ class EngineCoreProc(EngineCore):
                 outputs.engine_index = engine_index
 
                 if client_index == -1:
+                    # `-1` 不是普通前端 client，而是发给 coordinator 的控制/统计消息。
                     # Don't reuse buffer for coordinator message
                     # which will be very small.
                     assert coord_socket is not None
@@ -1484,6 +1534,8 @@ class EngineCoreProc(EngineCore):
 
     def _send_abort_outputs(self, aborted_reqs: list[tuple[str, int]]) -> None:
         # TODO(nick) this will be moved inside the scheduler
+        # 这里把“哪些请求被 abort 了”重新按 client 分组，组装成
+        # EngineCoreOutputs 发回去，避免前端一直等不到 finished 信号。
         if aborted_reqs:
             # Map client_index to list of request_ids that belong to that client.
             by_client = defaultdict[int, set[str]](set)
@@ -1499,6 +1551,11 @@ class EngineCoreProc(EngineCore):
 
 
 class DPEngineCoreProc(EngineCoreProc):
+    # MoE + DP 专用版本。
+    # 在普通 EngineCoreProc 的基础上，额外维护：
+    # 1. `current_wave`：当前这轮 DP 协同批次
+    # 2. `engines_running`：全局各 rank 是否仍有未完成请求
+    # 3. request count / step counter：给 coordinator 做内部负载均衡与状态同步
     """ZMQ-wrapper for running EngineCore in background process
     in a data parallel context."""
 
@@ -1563,6 +1620,8 @@ class DPEngineCoreProc(EngineCoreProc):
             if request_wave > self.current_wave:
                 self.current_wave = request_wave
             elif not self.engines_running:
+                # 当前 wave 已经结束，但前端又给了旧 wave 的请求，
+                # 说明需要显式通知前端/协调器启动下一轮。
                 # Request received for an already-completed wave, notify
                 # front-end that we need to start the next one.
                 self.output_queue.put_nowait(
@@ -1585,6 +1644,7 @@ class DPEngineCoreProc(EngineCoreProc):
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         if request_type == EngineCoreRequestType.START_DP_WAVE:
+            # 协调器要求所有 DP rank 从某个新 wave 开始恢复执行。
             new_wave, exclude_eng_index = request
             if exclude_eng_index != self.engine_index and (
                 new_wave >= self.current_wave
@@ -1600,7 +1660,8 @@ class DPEngineCoreProc(EngineCoreProc):
         if not self.publish_dp_lb_stats:
             return
 
-        # Publish our request counts (if they've changed).
+        # 把本 rank 当前 waiting/running 数上报给 coordinator，
+        # 供前端做内部负载均衡决策。
         counts = self.scheduler.get_request_counts()
         if counts != self.last_counts:
             self.last_counts = counts
@@ -1632,11 +1693,11 @@ class DPEngineCoreProc(EngineCoreProc):
                     # All engines are idle.
                     continue
 
-                # We are in a running state and so must execute a dummy pass
-                # if the model didn't execute any ready requests.
+                # 只要全局还处于 running wave，就算本 rank 这一轮没有可执行请求，
+                # 也要跑 dummy batch，避免不同 rank 的执行节拍脱离。
                 self.execute_dummy_batch()
 
-            # 3) All-reduce operation to determine global unfinished reqs.
+            # 每隔若干步做一次跨 DP rank 同步，判断“全局是否仍有未完成请求”。
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs
             )
@@ -1657,12 +1718,12 @@ class DPEngineCoreProc(EngineCoreProc):
                             EngineCoreOutputs(wave_complete=self.current_wave),
                         )
                     )
-                # Increment wave count and reset step counter.
+                # 当前 wave 完整结束，切到下一 wave。
                 self.current_wave += 1
                 self.step_counter = 0
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
+        # 这是一个性能优化：不是每步都 all-reduce，而是每 32 步同步一次。
         self.step_counter += 1
         if self.step_counter % 32 != 0:
             return True
@@ -1878,9 +1939,8 @@ class EngineCoreActorMixin:
         client_handshake_address: str | None,
     ):
         """
-        For Ray, we don't need to actually perform handshake.
-        All addresses information is known before the actor creation.
-        Therefore, we simply yield these addresses.
+        Ray 场景下，地址信息在 actor 创建前就已经准备好了，
+        不需要像多进程本地模式那样再走一遍 ZMQ startup handshake。
         """
         yield self.addresses
 
