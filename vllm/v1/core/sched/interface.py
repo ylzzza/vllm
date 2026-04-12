@@ -20,12 +20,12 @@ if TYPE_CHECKING:
 
 
 class PauseState(enum.IntEnum):
-    """Scheduler pause state.
+    """调度器的暂停状态。
 
-    - UNPAUSED: Normal operation
-    - PAUSE_NEW: No new requests are scheduled, requests already in
-                 running state are scheduled.
-    - PAUSE_ALL: No requests are scheduled
+    - UNPAUSED: 正常运行。
+    - PAUSED_NEW: 不再调度新请求，但仍会继续调度已经处于
+      running 状态的请求。
+    - PAUSED_ALL: 不调度任何请求。
     """
 
     UNPAUSED = 0
@@ -49,27 +49,23 @@ class SchedulerInterface(ABC):
 
     @abstractmethod
     def schedule(self) -> "SchedulerOutput":
-        """Schedule the requests to process in this scheduling step.
+        """决定这一调度步要处理哪些请求。
 
-        The scheduling decision is made at the iteration level. Each scheduling
-        step corresponds to a single forward pass of the model. Therefore, this
-        method is called repeatedly by a busy loop in the engine.
+        调度决策是在 iteration 粒度上做出的。每一个调度步基本对应模型
+        的一次前向计算，因此这个方法会在引擎的 busy loop 中被反复调用。
 
-        Essentially, the scheduler produces a dictionary of {req_id: num_tokens}
-        that specifies how many tokens to process for each request in this
-        scheduling step. For example, num_tokens can be as large as the number
-        of prompt tokens for new requests, or it can be 1 for the requests that
-        are auto-regressively generating new tokens one by one. Otherwise, it
-        can be somewhere in between in case of chunked prefills, prefix caching,
-        speculative decoding, etc.
+        从本质上说，调度器会产出一个形如 {req_id: num_tokens} 的映射，
+        表示这一轮中每个请求要处理多少个 token。比如，对新请求来说，
+        num_tokens 可能大到等于整个 prompt 的长度；而对正在自回归、
+        一次生成一个 token 的请求来说，num_tokens 可能就是 1。在
+        chunked prefill、prefix cache、speculative decoding 等场景下，
+        这个值也可能介于两者之间。
 
-        Additionally, the scheduler also returns useful data about each request
-        or the batch as a whole. The model runner will use this information in
-        preparing inputs to the model.
+        此外，调度器还会返回一些关于单个请求或整个 batch 的有用信息，
+        model runner 会用这些信息来准备模型输入。
 
         Returns:
-            A SchedulerOutput object containing information about the scheduled
-            requests.
+            一个 SchedulerOutput 对象，其中包含本轮被调度请求的信息。
         """
         raise NotImplementedError
 
@@ -85,27 +81,27 @@ class SchedulerInterface(ABC):
         scheduler_output: "SchedulerOutput",
         model_runner_output: "ModelRunnerOutput",
     ) -> dict[int, "EngineCoreOutputs"]:
-        """Update the scheduler state based on the model runner output.
+        """根据 model runner 的输出更新调度器状态。
 
-        This method is called after the model runner has processed the scheduled
-        requests. The model runner output includes generated token ids, draft
-        token ids for next step, etc. The scheduler uses this information to
-        update its states, checks the finished requests, and returns the output
-        for each request.
+        这个方法会在 model runner 处理完本轮调度请求之后调用。模型输出
+        中可能包含新生成的 token id、下一轮要用的 draft token id 等
+        信息。调度器会利用这些信息更新内部状态、检查哪些请求已经结束，
+        并为每个请求生成对应的输出。
 
         Returns:
-            A dict of client index to EngineCoreOutputs object containing the
-            outputs for each request originating from that client.
+            一个从 client index 到 EngineCoreOutputs 的映射，包含各个
+            client 发起请求的输出结果。
         """
         raise NotImplementedError
 
     @abstractmethod
     def update_draft_token_ids(self, draft_token_ids: "DraftTokenIds") -> None:
-        """Update requests with newly generated draft token ids, applying
-        structured output grammar validation if needed.
+        """用新生成的 draft token id 更新请求。
+
+        如有需要，还会对 structured output 执行 grammar 校验。
 
         Args:
-            draft_token_ids: The input draft token ids for each request.
+            draft_token_ids: 每个请求对应的 draft token id 输入。
         """
         raise NotImplementedError
 
@@ -113,22 +109,23 @@ class SchedulerInterface(ABC):
     def update_draft_token_ids_in_output(
         self, draft_token_ids: "DraftTokenIds", scheduler_output: "SchedulerOutput"
     ) -> None:
-        """Update scheduler output with newly generated draft token ids, applying
-        structured output grammar validation if needed.
+        """用新生成的 draft token id 更新 scheduler output。
+
+        如有需要，还会对 structured output 执行 grammar 校验。
 
         Args:
-            draft_token_ids: The input draft token ids for each request.
-            scheduler_output: Update the given scheduler_output
-                with the corresponding draft token ids.
+            draft_token_ids: 每个请求对应的 draft token id 输入。
+            scheduler_output: 要被更新的 scheduler_output，会写入对应的
+                draft token id。
         """
         raise NotImplementedError
 
     @abstractmethod
     def add_request(self, request: "Request") -> None:
-        """Add a new request to the scheduler's internal queue.
+        """向调度器内部队列加入一个新请求。
 
         Args:
-            request: The new request being added.
+            request: 要加入的新请求。
         """
         raise NotImplementedError
 
@@ -138,58 +135,58 @@ class SchedulerInterface(ABC):
         request_ids: str | Iterable[str] | None,
         finished_status: "RequestStatus",
     ) -> list[tuple[str, int]]:
-        """Finish the requests in the scheduler's internal queue. If the request
-        is not in the queue, this method will do nothing for that request.
+        """结束调度器内部队列中的请求。
 
-        This method is called in two cases:
-        1. When the request is aborted by the client.
-        2. When the frontend process detects a stop string of the request after
-           de-tokenizing its generated tokens.
+        如果某个请求不在队列里，这个方法不会对它做任何处理。
+
+        这个方法通常会在两种情况下调用：
+        1. 请求被客户端主动中止。
+        2. 前端进程在将生成 token 反解码后，检测到了该请求的 stop string。
 
         Args:
-            request_ids: A single or a list of request IDs, or None to finish all.
-            finished_status: The finished status of the given requests.
+            request_ids: 单个请求 ID、一组请求 ID，或 None。传 None 表示
+                结束所有请求。
+            finished_status: 这些请求要被设置成的结束状态。
 
         Returns:
-            Tuple of (req_id, client_index) for requests that were aborted. Will not
-            include any that were already finished.
+            返回被本次中止的请求 (req_id, client_index) 元组列表。
+            已经结束的请求不会重复包含在结果中。
         """
         raise NotImplementedError
 
     @abstractmethod
     def get_num_unfinished_requests(self) -> int:
-        """Number of unfinished requests in the scheduler's internal queue."""
+        """返回调度器内部队列中尚未完成的请求数量。"""
         raise NotImplementedError
 
     def has_unfinished_requests(self) -> bool:
-        """Returns True if there are unfinished requests in the scheduler's
-        internal queue."""
+        """如果调度器内部队列中还有未完成请求，则返回 True。"""
         return self.get_num_unfinished_requests() > 0
 
     @abstractmethod
     def has_finished_requests(self) -> bool:
-        """Returns True if there are finished requests that need to be cleared.
-        NOTE: This is different from `not self.has_unfinished_requests()`.
+        """如果存在仍需清理的已结束请求，则返回 True。
 
-        The scheduler maintains an internal list of the requests finished in the
-        previous step. This list is returned from the next call to schedule(),
-        to be sent to the model runner in the next step to clear cached states
-        for these finished requests.
+        注意：这和 `not self.has_unfinished_requests()` 不是一回事。
 
-        This method checks if this internal list of finished requests is
-        non-empty. This information is useful for DP attention.
+        调度器会维护一个内部列表，记录上一步中刚刚结束的请求。这个列表
+        会在下一次调用 schedule() 时返回出去，以便在下一步通知 model
+        runner 清理这些已结束请求对应的缓存状态。
+
+        这个方法就是用来检查这个“已结束请求内部列表”是否为空。
+        这对 DP attention 场景很有用。
         """
         raise NotImplementedError
 
     def has_requests(self) -> bool:
-        """Returns True if there are unfinished requests, or finished requests
-        not yet returned in SchedulerOutputs."""
+        """如果还有未完成请求，或还有尚未通过 SchedulerOutput 返回出去的
+        已结束请求，则返回 True。"""
         return self.has_unfinished_requests() or self.has_finished_requests()
 
     @property
     @abstractmethod
     def pause_state(self) -> PauseState:
-        """Current pause state of the scheduler."""
+        """当前调度器的暂停状态。"""
         raise NotImplementedError
 
     @abstractmethod
@@ -200,43 +197,41 @@ class SchedulerInterface(ABC):
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
-        """Reset the prefix cache for KV cache.
+        """重置 KV cache 的 prefix cache。
 
-        This is particularly required when the model weights are live-updated.
+        当模型权重发生热更新时，这个操作尤其重要。
 
         Args:
-            reset_running_requests: If True, all the running requests will be
-                preempted and moved to the waiting queue. Otherwise, this method
-                will only reset the KV prefix cache when there is no running request
-                taking KV cache.
+            reset_running_requests: 如果为 True，所有正在运行的请求都会先被
+                抢占并移回 waiting 队列。否则，只有在没有运行中请求占用
+                KV cache 时，才会执行 KV prefix cache 的重置。
         """
         raise NotImplementedError
 
     @abstractmethod
     def reset_encoder_cache(self) -> None:
-        """Reset the encoder cache to invalidate all cached encoder outputs.
+        """重置 encoder cache，使所有缓存过的 encoder 输出全部失效。
 
-        This should be called when model weights are updated to ensure
-        stale vision embeddings are not reused.
+        当模型权重更新时，应调用这个方法，避免复用过期的视觉 embedding。
         """
         raise NotImplementedError
 
     @abstractmethod
     def get_request_counts(self) -> tuple[int, int]:
-        """Returns (num_running_reqs, num_waiting_reqs)."""
+        """返回 `(num_running_reqs, num_waiting_reqs)`。"""
         raise NotImplementedError
 
     @abstractmethod
     def make_stats(self) -> "SchedulerStats | None":
-        """Make a SchedulerStats object for logging.
+        """生成一个用于日志记录的 SchedulerStats 对象。
 
-        The SchedulerStats object is created for every scheduling step.
+        这个 SchedulerStats 对象会在每一个调度步中创建。
         """
         raise NotImplementedError
 
     @abstractmethod
     def shutdown(self) -> None:
-        """Shutdown the scheduler."""
+        """关闭调度器。"""
         raise NotImplementedError
 
     def get_kv_connector(self) -> "KVConnectorBase_V1 | None":

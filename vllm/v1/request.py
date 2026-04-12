@@ -57,6 +57,13 @@ class StreamingUpdate:
 
 
 class Request:
+    """调度器内部使用的请求对象。
+
+    这个类是 v1 调度路径里的核心状态载体。一个请求从进入 scheduler、
+    被调度、执行、追加输出、命中/写入 prefix cache，到最终结束，相关状态
+    都会持续写回到这个对象里。
+    """
+
     def __init__(
         self,
         request_id: str,
@@ -75,106 +82,153 @@ class Request:
         resumable: bool = False,
         reasoning_ended: bool | None = None,
     ) -> None:
+        # 请求身份与路由信息。
+        # request_id: 请求的全局唯一标识。
         self.request_id = request_id
+        # client_index: 该请求来自哪个前端 client，用于把结果路由回去。
         self.client_index = client_index
+        # priority: 优先级调度时使用的优先级，值越小优先级越高。
         self.priority = priority
+
+        # 请求的执行配置。
+        # sampling_params: 文本生成请求的采样参数。
         self.sampling_params = sampling_params
+        # pooling_params: pooling 请求的参数。与 sampling_params 二选一。
         self.pooling_params = pooling_params
+        # lora_request: 该请求若使用 LoRA，这里保存对应的 LoRA 信息。
         self.lora_request = lora_request
+        # structured_output_request: 若采样参数启用了结构化输出，这里保存对应
+        # 的 grammar/FSM 请求对象；否则为 None。
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
         )
         if self.structured_output_request is not None:
+            # reasoning_ended: 结构化输出场景下，用于标记 reasoning 阶段是否结束。
             self.structured_output_request.reasoning_ended = reasoning_ended
+        # arrival_time: 请求进入系统的时间戳，用于 FCFS / priority 调度排序。
         self.arrival_time = arrival_time if arrival_time is not None else time.time()
 
+        # 生命周期与事件信息。
+        # status: 当前请求状态，决定它处于 waiting/running/preempted/finished
+        # 的哪个阶段。
         self.status = RequestStatus.WAITING
+        # events: 请求生命周期事件列表，用于日志、trace、观测。
         self.events: list[EngineCoreEvent] = []
+        # stop_reason: 请求停止的具体原因，例如命中 stop token/string。
         self.stop_reason: int | str | None = None
 
-        # P/D: Connector-specific KV transfer parameters.
+        # P/D 场景下的 connector 特定参数，例如远端 KV 传输所需的上下文。
         self.kv_transfer_params: dict[str, Any] | None = None
 
         if pooling_params is not None:
-            # Pooling models.
+            # max_tokens: 请求最多生成多少个 token。
+            # 对 pooling 模型没有“持续生成”过程，因此固定视作 1。
             self.max_tokens = 1
         elif sampling_params is not None:
-            # Generative models.
+            # 生成模型从 sampling_params 中读取 max_tokens。
             assert sampling_params.max_tokens is not None
             self.max_tokens = sampling_params.max_tokens
             if self.structured_output_request is not None:
+                # 结构化输出需要先等待 grammar/FSM 准备完成后才能调度。
                 self.status = RequestStatus.WAITING_FOR_FSM
 
             if sampling_params.extra_args is not None:
+                # extra_args 中可夹带 P/D 传输参数，供 connector 使用。
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
                 )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
+        # Prompt / token 相关状态。
+        # prompt_token_ids: 原始 prompt 的 token 序列；若走 prompt_embeds，则可能为 None。
         self.prompt_token_ids = prompt_token_ids
+        # prompt_embeds: 直接输入模型的 embedding 形式 prompt。
         self.prompt_embeds = prompt_embeds
-        # Cache per-block prompt-embed hashes to avoid rehashing the same
-        # tensor slices when generating extra keys.
+        # _prompt_embeds_per_block_hashes: prompt_embeds 按 block 切片后的 hash 缓存，
+        # 避免重复为同一段 embedding 反复计算 hash。
         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
+        # num_prompt_tokens: prompt 的 token 长度。无论输入来自 token ids
+        # 还是 prompt_embeds，都会统一折算成这个长度。
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             prompt_token_ids, prompt_embeds
         )
+        # _output_token_ids: 目前已经生成出来的输出 token。
         self._output_token_ids: list[int] = []
+        # _all_token_ids: 请求当前完整 token 序列 = prompt + 已生成输出。
+        # scheduler / prefix cache / block hash 计算都以它为基准。
         self._all_token_ids: list[int] = (
             self.prompt_token_ids.copy()
             if self.prompt_token_ids is not None
             else [0] * self.num_prompt_tokens
         )
 
-        # Used in async scheduling.
+        # 异步调度相关状态。
+        # num_output_placeholders: 异步调度时，为尚未真正落地的输出 token
+        # 预留的占位符数量。
         self.num_output_placeholders = 0
-        # Used in forced preemption (reset_prefix_cache) with async scheduling.
+        # discard_latest_async_tokens: 异步调度 + 强制抢占时，是否丢弃最近一次
+        # 异步生成的 token，避免恢复后重复。
         self.discard_latest_async_tokens = False
 
+        # speculative decoding / 调度进度 / prefix cache 相关状态。
+        # spec_token_ids: 当前为该请求暂存的 speculative draft token。
         self.spec_token_ids: list[int] = []
+        # num_computed_tokens: 已经完成模型计算的 token 数。它是 scheduler 里
+        # 最关键的进度计数之一，用来表示“这个请求已经推进到哪里了”。
         self.num_computed_tokens = 0
+        # cache_salt: 参与 prefix cache key/hash 计算的盐值，用来隔离缓存命名空间。
         self.cache_salt: str | None = cache_salt
 
-        # Multi-modal related
+        # 多模态相关状态。
+        # mm_features: 多模态输入特征列表，例如图像编码后的位置信息等。
         self.mm_features = mm_features or []
 
-        # Read-only views
-        # Prevent directly appending to these lists since
-        # they should also be updated simultaneously.
+        # 只读视图。
+        # output_token_ids / all_token_ids 对外暴露为只读列表，避免调用方直接
+        # append 导致内部多个 token 列表不一致。
         self.output_token_ids = ConstantList(self._output_token_ids)
         self.all_token_ids = ConstantList(self._all_token_ids)
-        # trace_headers
+        # trace_headers: 链路追踪相关 header，会透传到输出或观测链路中。
         self.trace_headers = trace_headers
-        # State
-        # The number of tokens with prefix cache hits.
+
+        # 调度与执行状态。
+        # num_cached_tokens: 当前请求中命中 prefix cache 的 token 数。
+        # -1 表示尚未统计/尚未初始化。
         self.num_cached_tokens = -1
 
-        # True if this request is scheduled as a non-final prefill chunk.
+        # is_prefill_chunk: 当前是否处在“prefill 被分块调度且尚未完成”的状态。
+        # True 表示这只是 prefill 的中间分片，不是最后一个分片。
         self.is_prefill_chunk = False
 
-        # The number of NaNs in logits. A value greater than 0
-        # indicates that the output is corrupted
+        # num_nans_in_logits: 本请求对应 logits 中出现 NaN 的数量。
+        # 大于 0 往往意味着输出已经损坏或模型执行异常。
         self.num_nans_in_logits = 0
 
-        # The number of times this request has been preempted by the scheduler.
+        # num_preemptions: 该请求被 scheduler 抢占过多少次。
+        # 这既会影响统计，也会影响某些缓存命中路径的处理方式。
         self.num_preemptions = 0
 
-        # The number of tokens that have been computed remotely.
+        # num_external_computed_tokens: 已由外部 connector / 远端 KV 侧计算好的
+        # token 数，本地可直接复用其 KV。
         self.num_external_computed_tokens = 0
 
+        # block_hashes: 按 block 粒度计算出的 hash 列表，用于 prefix cache 查询。
         self.block_hashes: list[BlockHash] = []
-        # Store the block hasher without binding self to avoid creating a
-        # reference cycle (Request -> partial -> Request) that prevents
-        # immediate garbage collection via reference counting.
+        # _block_hasher: 用于增量计算 block_hashes 的函数。
+        # 这里不把 self 绑定进闭包，避免形成引用环，影响及时回收。
         self._block_hasher: Callable[[Request], list[BlockHash]] | None = block_hasher
         self.update_block_hashes()
 
+        # skip_reading_prefix_cache: 当前请求是否应跳过读取 prefix cache。
+        # 常见于要求 prompt logprobs 或某些 pooling 路径。
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
-        # Used for streaming
+        # 流式续写相关状态。
+        # resumable: 该请求是否支持被视作一个“会话”并在后续继续追加输入。
         self.resumable = resumable
-        # None entry in the queue means finished.
+        # streaming_queue: 后续流式输入更新队列。队列里的每个元素都是一段新的
+        # StreamingUpdate；其中 None 是结束哨兵，表示整个 streaming 会话结束。
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
     @property
