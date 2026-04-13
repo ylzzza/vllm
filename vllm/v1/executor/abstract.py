@@ -34,21 +34,31 @@ FailureCallback = Callable[[], None]
 
 
 class Executor(ABC):
-    """Abstract base class for vLLM executors."
+    """vLLM 执行器的抽象基类。
 
-    An executor is responsible for executing the model on one device,
-    or it can be a distributed executor that can execute the model on multiple devices.
+    `Executor` 代表“调度器之下、worker 之上”的执行层抽象。
+    它的职责不是决定“这一轮跑哪些请求”，而是把 scheduler 产出的
+    `SchedulerOutput` 分发给底层 worker 去真正执行。
+
+    它既可以对应单设备执行器，也可以对应多设备/多进程分布式执行器。
+    上层 `EngineCore` 只依赖这层统一接口，而不需要关心底层到底是：
+
+    1. 单进程本地执行
+    2. 多进程执行
+    3. Ray 分布式执行
+    4. 外部 launcher 管理的执行
     """
 
-    uses_ray: bool = False  # whether the executor uses Ray for orchestration.
-    supports_pp: bool = False  # whether the executor supports PP
+    uses_ray: bool = False  # 是否使用 Ray 进行编排。
+    supports_pp: bool = False  # 是否支持 pipeline parallel。
 
     @staticmethod
     def get_class(vllm_config: VllmConfig) -> type["Executor"]:
         executor_class: type[Executor]
         parallel_config = vllm_config.parallel_config
         distributed_executor_backend = parallel_config.distributed_executor_backend
-        # distributed_executor_backend must be set in VllmConfig.__post_init__
+        # distributed_executor_backend 会在 VllmConfig.__post_init__ 中补齐。
+        # 这里根据配置选择真正的执行器实现类。
         if isinstance(distributed_executor_backend, type):
             if not issubclass(distributed_executor_backend, Executor):
                 raise TypeError(
@@ -69,8 +79,8 @@ class Executor(ABC):
 
             executor_class = UniProcExecutor
         elif distributed_executor_backend == "external_launcher":
-            # TODO: make v1 scheduling deterministic
-            # to support external launcher
+            # TODO: 需要先让 v1 scheduling 的行为完全确定化，
+            # 才能更好支持 external launcher 场景。
             executor_class = ExecutorWithExternalLauncher
         elif isinstance(distributed_executor_backend, str):
             executor_class = resolve_obj_by_qualname(distributed_executor_backend)
@@ -90,6 +100,7 @@ class Executor(ABC):
         self,
         vllm_config: VllmConfig,
     ) -> None:
+        # 复制常用配置字段，便于子类和执行路径直接访问。
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -103,6 +114,7 @@ class Executor(ABC):
         self._init_executor()
         self.is_sleeping = False
         self.sleeping_tags: set[str] = set()
+        # 当存在 KV connector 且需要跨 worker 聚合其输出时使用。
         self.kv_output_aggregator: KVOutputAggregator | None = None
 
     @abstractmethod
@@ -111,15 +123,19 @@ class Executor(ABC):
 
     def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
         """
-        Initialize the KV caches and begin the model execution loop of the
-        underlying workers.
+        根据配置初始化底层 worker 的 KV cache，并完成执行前预热。
+
+        运行主线如下：
+        1. 通过 RPC 把 `kv_cache_configs` 下发给所有 worker
+        2. 让每个 worker 分配并初始化自己的 KV cache
+        3. 触发 worker 侧编译/预热
+        4. 把 worker 侧统计到的编译时间回写到主进程配置中
         """
         self.collective_rpc("initialize_from_config", args=(kv_cache_configs,))
         compilation_times: list[float] = self.collective_rpc("compile_or_warm_up_model")
-        # Propagate compilation time from workers back to the main process.
-        # With TP>1, compilation happens in worker processes, so the main
-        # process config is never updated. Use max across workers since they
-        # compile in parallel.
+        # 多卡场景下，真正的编译通常发生在 worker 进程内，主进程自己的配置对象
+        # 并不会自动更新。因此这里把 worker 侧的编译耗时聚合回主进程。
+        # 由于各 worker 是并行编译的，这里取最大值更符合整体初始化耗时。
         if compilation_times:
             self.vllm_config.compilation_config.compilation_time = max(
                 compilation_times
@@ -127,12 +143,14 @@ class Executor(ABC):
 
     def register_failure_callback(self, callback: FailureCallback):  # noqa: B027
         """
-        Register a function to be called if the executor enters a permanent
-        failed state.
+        注册一个失败回调。
+
+        当 executor 进入不可恢复的失败状态时，会调用这个函数通知上层。
+        默认实现为空，具体行为由子类决定。
         """
         pass
 
-    def determine_available_memory(self) -> list[int]:  # in bytes
+    def determine_available_memory(self) -> list[int]:  # 单位：bytes
         return self.collective_rpc("determine_available_memory")
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
@@ -148,28 +166,27 @@ class Executor(ABC):
         non_block: Literal[False] = False,
     ) -> list[_R]:
         """
-        Execute an RPC call on all workers.
+        在所有 worker 上执行一次 RPC 调用。
 
-        Args:
-            method: Name of the worker method to execute, or a callable that
-                is serialized and sent to all workers to execute.
+        参数：
+            method: 要执行的 worker 方法名，或者一个会被序列化后发送给
+                所有 worker 执行的可调用对象。
 
-                If the method is a callable, it should accept an additional
-                `self` argument, in addition to the arguments passed in `args`
-                and `kwargs`. The `self` argument will be the worker object.
-            timeout: Maximum time in seconds to wait for execution. Raises a
-                [`TimeoutError`][] on timeout. `None` means wait indefinitely.
-            args: Positional arguments to pass to the worker method.
-            kwargs: Keyword arguments to pass to the worker method.
-            non_block: If `True`, returns a list of Futures instead of waiting
-                for the results.
+                如果 `method` 是可调用对象，它除了接收 `args/kwargs` 中的
+                参数之外，还应额外接收一个 `self` 参数，这个 `self`
+                就是目标 worker 对象。
+            timeout: 最长等待秒数。超时会抛出 `TimeoutError`。
+                `None` 表示一直等待。
+            args: 传给 worker 方法的位置参数。
+            kwargs: 传给 worker 方法的关键字参数。
+            non_block: 若为 `True`，则立即返回 Future，而不是阻塞等待结果。
 
-        Returns:
-            A list containing the results from each worker.
+        返回：
+            一个列表，包含每个 worker 的返回结果。
 
-        Note:
-            It is recommended to use this API to only pass control messages,
-            and set up data-plane communication to pass data.
+        说明：
+            这个接口更适合传输控制面消息；真正的大数据面传输，通常应由
+            专门的数据通道负责。
         """
         pass
 
@@ -210,6 +227,10 @@ class Executor(ABC):
     def execute_model(
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        # 默认实现直接把本轮 SchedulerOutput 广播到所有 worker。
+        # 对于单设备执行器，等价于直接调用单个 worker；
+        # 对于分布式执行器，子类可通过重写 collective_rpc / execute_model
+        # 来优化“只收一个 rank 的返回结果”等细节。
         output = self.collective_rpc(  # type: ignore[call-overload]
             "execute_model", args=(scheduler_output,), non_block=non_block
         )
@@ -230,6 +251,8 @@ class Executor(ABC):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None, non_block: bool = False
     ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:
+        # 当 execute_model 只完成前向而未返回采样结果时，再通过这个接口
+        # 补做采样。
         output = self.collective_rpc(  # type: ignore[call-overload]
             "sample_tokens", args=(grammar_output,), non_block=non_block
         )
@@ -239,6 +262,8 @@ class Executor(ABC):
         self.collective_rpc("execute_dummy_batch")
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
+        # draft token 目前通常只需从单个输出 worker 回收即可；
+        # 默认实现仍沿用 collective_rpc，再取第一个结果。
         output: list[DraftTokenIds] = self.collective_rpc("take_draft_token_ids")
         return output[0]
 
@@ -262,21 +287,20 @@ class Executor(ABC):
 
     @abstractmethod
     def check_health(self) -> None:
-        """Checks if the executor is healthy. If not, it should raise an
-        exception."""
+        """检查 executor 是否健康；若不健康，应抛出异常。"""
         raise NotImplementedError
 
     def shutdown(self) -> None:
-        """Shutdown the executor."""
+        """关闭 executor。"""
         self.collective_rpc("shutdown")
 
     def init_kv_output_aggregator(self, connector: "KVConnectorBase") -> None:
-        """Init KVOutputAggregator"""
+        """初始化 KV 输出聚合器。"""
         self.kv_output_aggregator = KVOutputAggregator.from_connector(
             connector, self.parallel_config.world_size
         )
 
-    @cached_property  # Avoid unnecessary RPC calls
+    @cached_property  # 避免重复执行不必要的 RPC。
     def supported_tasks(self) -> tuple[SupportedTask, ...]:
         output: list[tuple[SupportedTask, ...]]
         output = self.collective_rpc("get_supported_tasks")
@@ -301,17 +325,18 @@ class Executor(ABC):
         return sets[0]
 
     def reset_mm_cache(self) -> None:
-        """Reset the multi-modal cache in each worker."""
+        """重置每个 worker 中的多模态缓存。"""
         self.collective_rpc("reset_mm_cache")
 
     def reset_encoder_cache(self) -> None:
-        """Reset the encoder cache in each worker to clear cached encoder outputs."""
+        """重置每个 worker 中的 encoder cache，清除已缓存的 encoder 输出。"""
         self.collective_rpc("reset_encoder_cache")
 
     def sleep(self, level: int = 1):
         if self.is_sleeping:
             logger.warning("Executor is already sleeping.")
             return
+        # 通过 RPC 让所有 worker 进入睡眠态，并记录仍处于睡眠中的资源标签。
         time_before_sleep = time.perf_counter()
         self.collective_rpc("sleep", kwargs=dict(level=level))
         time_after_sleep = time.perf_counter()
@@ -325,6 +350,7 @@ class Executor(ABC):
         if not self.is_sleeping:
             logger.warning("Executor is not sleeping.")
             return
+        # tags=None 表示唤醒全部资源；否则仅唤醒指定标签。
         if tags:
             for tag in tags:
                 if tag not in self.sleeping_tags:
@@ -361,6 +387,6 @@ from vllm.v1.executor.uniproc_executor import (  # noqa: E402
     UniProcExecutor as _UniProcExecutor,
 )
 
-# For backwards compatibility.
+# 为了向后兼容，保留旧名字导出。
 UniProcExecutor = _UniProcExecutor
 ExecutorWithExternalLauncher = _ExecutorWithExternalLauncher
