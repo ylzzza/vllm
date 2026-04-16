@@ -28,37 +28,53 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 @dataclass
 class CachedRequestState:
+    # 请求的全局唯一标识，会在 scheduler、runner、输出对象之间传递。
     req_id: str
+    # prompt 对应的 token ids；如果输入只提供了 prompt_embeds，则这里为 None。
     prompt_token_ids: list[int] | None
+    # 该请求携带的多模态特征，例如图片/音频编码所需的描述信息。
     mm_features: list[MultiModalFeatureSpec]
+    # 生成请求的采样参数；对于 pooling 请求这里通常为 None。
     sampling_params: SamplingParams | None
+    # 该请求自己的随机数发生器，用于带 seed 的可复现采样。
     generator: torch.Generator | None
 
+    # 该请求占用的 KV cache block 编号，按 kv cache group 分组保存。
     block_ids: tuple[list[int], ...]
+    # 当前已经完成 forward 计算的 token 数。
     num_computed_tokens: int
+    # 到目前为止已经生成出来的输出 token ids。
     output_token_ids: list[int]
 
+    # M-RoPE 模型所需的预计算位置张量。
     mrope_positions: torch.Tensor | None = None
+    # 与 M-RoPE 位置一同返回的模型相关偏移量。
     mrope_position_delta: int | None = None
 
+    # XD-RoPE 模型所需的预计算位置张量。
     xdrope_positions: torch.Tensor | None = None
 
+    # 该请求绑定的 LoRA 适配器；没有则为 None。
     lora_request: LoRARequest | None = None
+    # 调用方直接提供的 prompt embedding；有它时 prompt_token_ids 可能为空。
     prompt_embeds: torch.Tensor | None = None
 
-    # Used when both async_scheduling and spec_decode are enabled.
+    # 上一轮携带的 draft token 数量，主要用于 async + spec decode 场景。
     prev_num_draft_len: int = 0
 
-    # for pooling models
+    # pooling/embedding 请求的配置。
     pooling_params: PoolingParams | None = None
+    # pooling 请求跨 step 累积的运行时状态。
     pooling_states: PoolingStates | None = None
 
     def __post_init__(self):
+        # prompt 的长度，可能来自 token ids，也可能来自 prompt embeddings。
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             self.prompt_token_ids, self.prompt_embeds
         )
 
         if self.pooling_params is not None:
+            # pooling 请求会维护一份逐步更新的聚合状态。
             self.pooling_states = PoolingStates()
 
     @property
@@ -79,6 +95,13 @@ class CachedRequestState:
 
 
 class InputBatch:
+    """runner 当前维护的持久化 batch 视图。
+
+    它不是“一轮构造、用完即丢”的临时对象，而是会随着 scheduler 的每一轮调度
+    原地更新。大多数成员都按 `req_index` 索引，`req_index` 表示当前活跃请求在
+    batch 里的紧凑槽位。
+    """
+
     def __init__(
         self,
         max_num_reqs: int,
@@ -96,48 +119,63 @@ class InputBatch:
         is_pooling_model: bool = False,
         cp_kv_cache_interleave_size: int = 1,
     ):
+        # batch 的模式标记与容量上限。
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
+        # runner 自己管理的 buffer 所在设备及 host 传输策略。
         self.device = device
         self.pin_memory = pin_memory
+        # 模型词表大小，后续采样、mask 构造等都会用到。
         self.vocab_size = vocab_size
 
+        # 当前 batch 中活跃请求的 req_id，顺序与 req_index 一一对应。
+        # 在删除/压缩 batch 的中间过程里，某些位置可能会暂时为 None。
         self._req_ids: list[str | None] = []
+        # req_id 到当前 req_index 的反向映射。
         self.req_id_to_index: dict[str, int] = {}
 
         # TODO(woosuk): This buffer could be too large if max_model_len is big.
         # Find a way to reduce the CPU memory usage.
         # This buffer is not directly transferred to the GPU, so it does not
         # need to be pinned.
+        # CPU 侧的稠密 token 缓冲区，形状为 [max_num_reqs, max_model_len]。
         self.token_ids_cpu_tensor = torch.zeros(
             (max_num_reqs, max_model_len),
             device="cpu",
             dtype=torch.int32,
             pin_memory=False,
         )
+        # `token_ids_cpu_tensor` 的 numpy 视图，方便在 CPU 侧快速修改。
         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+        # 标记每个位置当前是 token id 还是 prompt embed。
         self.is_token_ids_tensor = torch.zeros(
             (max_num_reqs, max_model_len), device="cpu", dtype=bool, pin_memory=False
         )
+        # `is_token_ids_tensor` 的 numpy 视图。
         self.is_token_ids = self.is_token_ids_tensor.numpy()
         # Store prompt embeddings per request to avoid OOM from large upfront
         # allocation if max_model_len is big.
         # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)
+        # 对于不直接使用 token ids 的请求，这里按 req_index 单独保存 prompt embeds。
         self.req_prompt_embeds: dict[int, torch.Tensor] = {}
+        # 每个请求当前真实 token 数，不包含 speculative draft token。
         self.num_tokens_no_spec = np.zeros(max_num_reqs, dtype=np.int32)
+        # 每个请求的 prompt 长度。
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
+        # 已经完成 forward 计算的 token 数，放在 pinned CPU tensor 中。
         self.num_computed_tokens_cpu_tensor = torch.zeros(
             (max_num_reqs,),
             device="cpu",
             dtype=torch.int32,
             pin_memory=pin_memory,
         )
+        # `num_computed_tokens_cpu_tensor` 的 numpy 视图。
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
 
-        # Block table.
+        # 所有 kv cache group 对应的 block table / slot mapping 容器。
         self.block_table = MultiGroupBlockTable(
             max_num_reqs=max_num_reqs,
             max_model_len=max_model_len,
@@ -150,123 +188,158 @@ class InputBatch:
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
         )
 
-        # Sampling-related.
+        # sampler 在 GPU 上使用的 temperature 张量。
         self.temperature = torch.empty(
             (max_num_reqs,), dtype=torch.float32, device=device
         )
+        # temperature 的 pinned CPU staging buffer。
         self.temperature_cpu_tensor = torch.empty(
             (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=pin_memory
         )
+        # `temperature_cpu_tensor` 的 numpy 视图。
         self.temperature_cpu = self.temperature_cpu_tensor.numpy()
+        # 当前使用 greedy 解码的请求集合。
         self.greedy_reqs: set[str] = set()
+        # 当前使用随机采样的请求集合。
         self.random_reqs: set[str] = set()
 
+        # sampler 在 GPU 上使用的 top-p 张量。
         self.top_p = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)
+        # top-p 的 pinned CPU staging buffer。
         self.top_p_cpu_tensor = torch.empty(
             (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=pin_memory
         )
+        # `top_p_cpu_tensor` 的 numpy 视图。
         self.top_p_cpu = self.top_p_cpu_tensor.numpy()
+        # 真正启用了 top-p 限制的请求集合，即 top-p < 1.0。
         self.top_p_reqs: set[str] = set()
 
+        # sampler 在 GPU 上使用的 top-k 张量。
         self.top_k = torch.empty((max_num_reqs,), dtype=torch.int32, device=device)
+        # top-k 的 pinned CPU staging buffer。
         self.top_k_cpu_tensor = torch.empty(
             (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
         )
+        # `top_k_cpu_tensor` 的 numpy 视图。
         self.top_k_cpu = self.top_k_cpu_tensor.numpy()
+        # 真正启用了 top-k 限制的请求集合。
         self.top_k_reqs: set[str] = set()
 
-        # Frequency penalty related data structures
+        # sampler 在 GPU 上使用的 frequency penalty 张量。
         self.frequency_penalties = torch.empty(
             (max_num_reqs,), dtype=torch.float, device=device
         )
+        # frequency penalty 的 pinned CPU staging buffer。
         self.frequency_penalties_cpu_tensor = torch.empty(
             (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=pin_memory
         )
+        # `frequency_penalties_cpu_tensor` 的 numpy 视图。
         self.frequency_penalties_cpu = self.frequency_penalties_cpu_tensor.numpy()
+        # 启用了非零 frequency penalty 的请求集合。
         self.frequency_penalties_reqs: set[str] = set()
 
-        # Presence penalty related data structures
+        # sampler 在 GPU 上使用的 presence penalty 张量。
         self.presence_penalties = torch.empty(
             (max_num_reqs,), dtype=torch.float, device=device
         )
+        # presence penalty 的 pinned CPU staging buffer。
         self.presence_penalties_cpu_tensor = torch.empty(
             (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=pin_memory
         )
+        # `presence_penalties_cpu_tensor` 的 numpy 视图。
         self.presence_penalties_cpu = self.presence_penalties_cpu_tensor.numpy()
+        # 启用了非零 presence penalty 的请求集合。
         self.presence_penalties_reqs: set[str] = set()
 
-        # Repetition penalty related data structures
+        # sampler 在 GPU 上使用的 repetition penalty 张量。
         self.repetition_penalties = torch.empty(
             (max_num_reqs,), dtype=torch.float, device=device
         )
+        # repetition penalty 的 pinned CPU staging buffer。
         self.repetition_penalties_cpu_tensor = torch.empty(
             (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=pin_memory
         )
+        # `repetition_penalties_cpu_tensor` 的 numpy 视图。
         self.repetition_penalties_cpu = self.repetition_penalties_cpu_tensor.numpy()
+        # repetition penalty 不等于中性值 1.0 的请求集合。
         self.repetition_penalties_reqs: set[str] = set()
 
-        # Speculative decoding
+        # 上一轮 speculative decoding 中每个请求最终接受的 token 数。
         self.num_accepted_tokens_cpu_tensor = torch.ones(
             (max_num_reqs,), dtype=torch.int64, device="cpu", pin_memory=pin_memory
         )
+        # `num_accepted_tokens_cpu_tensor` 的 numpy 视图。
         self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
 
-        # lora related
+        # 每个 req_index 对应的 LoRA ID；0 表示没有 LoRA。
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
+        # LoRA ID 到正在使用它的请求集合的反向映射。
         self.lora_id_to_request_ids: dict[int, set[str]] = {}
+        # 当前活跃的 LoRARequest 对象，按 LoRA ID 索引。
         self.lora_id_to_lora_request: dict[int, LoRARequest] = {}
 
         # req_index -> generator
         # NOTE(woosuk): The indices of the requests that do not have their own
         # generator should not be included in the dictionary.
+        # 每个请求独立的随机数状态；只有确实需要时才会存进来。
         self.generators: dict[int, torch.Generator] = {}
 
+        # 每个请求要求返回多少个 logprobs。
         self.num_logprobs: dict[str, int] = {}
 
-        # To accumulate prompt logprobs tensor chunks across prefill steps.
+        # 在 chunked prefill 场景下，按 req_id 暂存尚未收齐的 prompt logprobs。
         self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
 
-        # Internal representation of per-step batch state changes, used for
-        # reordering persistent batch and generating logitsprocs batch state
-        # updates. Should reset each step.
+        # 记录每一轮 batch 的增删改移动，用于维护持久 batch 和同步 logits
+        # processor 的内部状态；每轮结束后会重置。
         self.batch_update_builder = BatchUpdateBuilder()
 
         # TODO convert this to LogitsProcessor
+        # 启用了 allowed_token_ids 限制的请求集合。
         self.has_allowed_token_ids: set[str] = set()
         # NOTE(lufang): In the mask tensor, if the corresponding token allowed,
         # the value is False. Since we use masked_fill_ to set -inf.
+        # GPU 侧的 allowed-token mask，用来屏蔽不允许输出的 token。
         self.allowed_token_ids_mask: torch.Tensor | None = None
+        # `allowed_token_ids_mask` 的 CPU 侧副本，用于构造和刷新。
         self.allowed_token_ids_mask_cpu_tensor: torch.Tensor | None = None
 
         # req_index -> bad_words_token_ids
+        # 每个请求对应的 bad words token 序列，用于采样阶段过滤。
         self.bad_words_token_ids: dict[int, list[list[int]]] = {}
 
+        # 每个请求是否需要 prompt token ids 参与 logits 后处理逻辑。
         self.logits_processing_needs_token_ids = np.zeros(max_num_reqs, dtype=bool)
 
+        # 按 req_index 保存的输出 token 列表引用，直接指向各请求的 output_token_ids。
         self.req_output_token_ids: list[list[int] | None] = []
 
-        # Store provided logitsprocs. If none are provided, initialize empty
-        # data structure
+        # 当前 runner 持有的 batch 级 logits processors；若未提供则初始化为空集合。
         self.logitsprocs = logitsprocs or LogitsProcessors()
+        # 是否有自定义 logits processor 依赖历史输出 token。
         self.logitsprocs_need_output_token_ids = logitsprocs_need_output_token_ids
 
-        # Store last speculative tokens for sampler.
+        # 当前 batch 上挂着的 speculative draft token ids，按 req_index 保存。
         self.spec_token_ids: list[list[int]] = [[] for _ in range(max_num_reqs)]
 
-        # This is updated each time the batch constituents change.
+        # 从以上 req-indexed 状态物化出的 sampler 输入元数据。
         self.sampling_metadata = self._make_sampling_metadata()
 
-        # for pooling models
+        # pooling 模型下，按 req_id 保存的 pooling 参数。
         self.pooling_params: dict[str, PoolingParams] = {}
+        # pooling 模型下，按 req_id 保存的可变 pooling 状态。
         self.pooling_states: dict[str, PoolingStates] = {}
 
-        # Cached reference to the GPU tensor of previously sampled tokens
+        # 异步调度时，上一轮采样结果在 GPU 上的缓存引用。
         self.prev_sampled_token_ids: torch.Tensor | None = None
+        # req_id 到 `prev_sampled_token_ids` 行号的映射。
         self.prev_req_id_to_index: dict[str, int] | None = None
         # These are used to update output_token_ids with real sampled
         # ids from prior step, if required by current sampling params
         # (e.g. penalties).
+        # 异步 DMA 完成后，上一轮采样 token 在 CPU 上的副本。
         self.sampled_token_ids_cpu: torch.Tensor | None = None
+        # 标记 `sampled_token_ids_cpu` 已可安全读取的事件。
         self.async_copy_ready_event: torch.Event | None = None
 
     @property
