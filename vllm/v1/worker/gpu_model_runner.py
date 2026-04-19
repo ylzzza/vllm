@@ -925,7 +925,7 @@ class GPUModelRunner(
         这一步做完后，`self.input_batch` 就表示“本轮真正要送入模型”的批状态，
         `_prepare_inputs()` 会据此构造 GPU 输入张量。
         """
-        # 先从缓存状态中移除已经结束的请求。
+        # 1.先从缓存状态中移除已经结束的请求。
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
@@ -940,7 +940,7 @@ class GPUModelRunner(
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)
 
-        # 从持久 batch 中移除“本轮没被调度”的请求。
+        # 2.从持久 batch 中移除“本轮没被调度”的请求。
         # NOTE(woosuk): 它们可能是被抢占了，也可能只是这一轮没轮到；
         # 因此这里只从 batch 里移走，不删除 requests 中的缓存状态。
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
@@ -956,7 +956,7 @@ class GPUModelRunner(
             self.input_batch.remove_request(req_id)
 
         reqs_to_add: list[CachedRequestState] = []
-        # 为本轮新增请求建立缓存状态。
+        # 3.为本轮新增请求建立缓存状态。
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             if req_id in self.requests:
