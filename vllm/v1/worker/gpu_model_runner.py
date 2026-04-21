@@ -1777,6 +1777,25 @@ class GPUModelRunner(
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """构造 attention backend 需要的 metadata。
 
+        可以把这个函数理解成“把 runner 已经整理好的 batch 布局，翻译成
+        attention backend 能直接消费的描述结构”。
+
+        这里不再重新计算 token 内容，而是围绕以下四类布局信息组装 metadata：
+        1. `query_start_loc`
+           把拍平后的 query token buffer 重新切回“按请求分段”的前缀和数组。
+        2. `seq_lens`
+           每个请求在“本轮执行完成后”的总长度，用来确定能看到多长的 KV 上下文。
+        3. `block_table_tensor`
+           每个请求当前占用了哪些 KV cache block。
+        4. `slot_mapping`
+           拍平后的第 `j` 个 query token 应当把新 KV 写回哪个 cache slot。
+
+        运算上，这个函数主要做三层转换：
+        1. 先把所有 KV cache group 共用的字段打包成 `CommonAttentionMetadata`。
+        2. 再按 KV cache group 覆盖 group 特有字段
+           （典型是 `block_table` / `slot_mapping` / `encoder_seq_lens`）。
+        3. 最后交给各 attention backend 的 builder，产出真正的 per-layer metadata。
+
         返回：
             `(attn_metadata, spec_decode_common_attn_metadata)`
         """
@@ -1787,6 +1806,9 @@ class GPUModelRunner(
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
         assert num_reqs_padded is not None and num_tokens_padded is not None
+        # `num_tokens/num_reqs` 表示真实 batch 大小；
+        # `*_padded` 表示为了 cudagraph / 固定形状执行额外补齐后的视图大小。
+        # metadata 里的张量通常按 padded 维度构造，但逻辑语义仍然描述真实请求。
 
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
@@ -1797,9 +1819,15 @@ class GPUModelRunner(
             # 足够大的 max_seq_len，才能选中正确 kernel。
             max_seq_len = self.max_model_len
         else:
+            # `seq_lens` 已经在 `_prepare_inputs()` 中被更新成
+            # “本轮 forward 执行完成后”的序列长度，这里直接取 batch 最大值。
             max_seq_len = self.seq_lens.np[:num_reqs].max().item()
 
         if use_spec_decode:
+            # speculative decoding 的某些 backend 需要知道：
+            # 1. 每个请求本轮最终接受了多少 token
+            # 2. decode 请求本轮携带了多少 draft token
+            # 这两份信息在这里统一同步到 runner 的 staging buffer。
             self.num_accepted_tokens.np[:num_reqs] = (
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs]
             )
@@ -1812,6 +1840,8 @@ class GPUModelRunner(
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                # encoder-only attention 不走 decoder KV cache，
+                # 这里给一个占位 block table，让后续 metadata 形状保持一致。
                 blk_table_tensor = torch.zeros(
                     (num_reqs_padded, 1),
                     dtype=torch.int32,
@@ -1832,6 +1862,16 @@ class GPUModelRunner(
 
         if self.model_config.enable_return_routed_experts:
             self.slot_mapping = slot_mapping_gid_0[:num_tokens].cpu().numpy()
+        # 先构造一份“所有 group 都共用”的 metadata 基座。
+        #
+        # 这里最关键的四个字段是：
+        # - `query_start_loc`: 一维 query buffer 中，每个请求的起始偏移
+        # - `seq_lens`: 每个请求执行完本轮后的总长度
+        # - `block_table_tensor`: 请求 -> KV block 映射
+        # - `slot_mapping`: token -> KV slot 映射
+        #
+        # 后续不同 KV cache group 只需要在这份基座上覆写少数字段，
+        # 再交给各 backend 的 builder 做最后一跳转换。
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -1883,6 +1923,8 @@ class GPUModelRunner(
             common_attn_metadata: CommonAttentionMetadata,
             ubid: int | None = None,
         ) -> None:
+            # 一个 attention group 往往对应多层共享同构的 attention 配置；
+            # 因此这里按 group 构建一次，后面复用给该 group 下所有层。
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
@@ -1895,6 +1937,9 @@ class GPUModelRunner(
                 if cascade_attn_prefix_lens
                 else 0
             )
+            # `cascade_attn_prefix_len` 表示这一组层在本轮允许复用的公共前缀长度。
+            # builder 会据此决定是否把 attention 拆成“公共前缀 + 剩余部分”
+            # 两段执行。
 
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(
@@ -1909,6 +1954,7 @@ class GPUModelRunner(
                 )
 
             if for_cudagraph_capture:
+                # 捕获阶段要求 metadata 形状稳定，因此交给 builder 的 capture 路径。
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
@@ -1916,12 +1962,17 @@ class GPUModelRunner(
                 cache_key in cached_attn_metadata
                 and builder.supports_update_block_table
             ):
+                # 对 hybrid KV cache 而言，不同 group 的 metadata 往往只有
+                # block table / slot mapping 不同；这时直接在旧 metadata 上
+                # 替换这两项，比完整重建更便宜。
                 attn_metadata_i = builder.update_block_table(
                     cached_attn_metadata[cache_key],
                     common_attn_metadata.block_table_tensor,
                     common_attn_metadata.slot_mapping,
                 )
             else:
+                # 常规路径：把公共布局信息 + group 特有信息交给 backend builder，
+                # 由 backend 产出自己真正需要的索引、页表、分段信息等结构。
                 attn_metadata_i = builder.build(
                     common_prefix_len=cascade_attn_prefix_len,
                     common_attn_metadata=common_attn_metadata,
@@ -1937,6 +1988,7 @@ class GPUModelRunner(
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
 
+            # 同一个 attention group 内的多层共享同一份 metadata 实例。
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
 
@@ -1955,6 +2007,8 @@ class GPUModelRunner(
                 for_cudagraph_capture=for_cudagraph_capture,
             )
             if kv_cache_gid > 0:
+                # group 0 之外的组，KV block 布局与 slot mapping 可能不同，
+                # 因此在公共基座上替换为该组自己的视图。
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
@@ -1967,6 +2021,8 @@ class GPUModelRunner(
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
+                    # 开启 ubatching 时，要先把这一组 metadata 按 request/token
+                    # 切成多个子 batch；每个 ubatch 再单独交给 builder 构建。
                     for ubid, _cm in enumerate(split_attn_metadata(ubatch_slices, cm)):
                         _build_attn_group_metadata(kv_cache_gid, attn_gid, _cm, ubid)
 
