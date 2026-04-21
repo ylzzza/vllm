@@ -1339,6 +1339,13 @@ class GPUModelRunner(
         # 需要直接从 GPU 上的 prev_sampled_token_ids 回填到本轮输入里。
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
         assert prev_req_id_to_index is not None
+        # 下面四个列表分成两组“目标位置 / 源位置”：
+        # 1. sampled token:
+        #    - sample_flattened_indices: 本轮拍平 input_ids 中，sampled token 的目标位置
+        #    - prev_common_req_indices: 上一轮 prev_sampled_token_ids 中，对应请求的源行号
+        # 2. speculative draft token:
+        #    - spec_flattened_indices: 本轮拍平 input_ids 中，各 draft token 的目标位置
+        #    - prev_draft_token_indices: 上一轮 _draft_token_ids.flatten() 中，各 draft token 的源下标
         sample_flattened_indices: list[int] = []
         spec_flattened_indices: list[int] = []
         prev_common_req_indices: list[int] = []
@@ -1401,6 +1408,8 @@ class GPUModelRunner(
         prev_common_req_indices_tensor = torch.tensor(
             prev_common_req_indices, dtype=torch.int64, pin_memory=self.pin_memory
         ).to(self.device, non_blocking=True)
+        # 把“上一轮公共请求的 sampled token”按
+        # prev_common_req_indices -> sample_flattened_indices 的映射写回本轮输入。
         self.input_ids.gpu.scatter_(
             dim=0,
             index=sampled_tokens_index_tensor,
@@ -1424,6 +1433,8 @@ class GPUModelRunner(
         # input_ids 是 int32，因此 draft_token_ids 也要先转成 int32。
         draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
 
+        # 再把“上一轮的 draft token”按
+        # prev_draft_token_indices -> spec_flattened_indices 的映射写回本轮输入。
         self.input_ids.gpu.scatter_(
             dim=0,
             index=draft_tokens_index_tensor,
@@ -1481,33 +1492,70 @@ class GPUModelRunner(
         torch.Tensor,
         SpecDecodeMetadata | None,
     ]:
-        """把 `InputBatch` 中的持久状态整理成本轮前向要用的输入。
+        """把 `InputBatch` 中的持久状态物化成本轮前向执行所需的全部输入。
 
-        这一步的产物主要有两类：
-        1. 真正送入模型的输入张量，如 `input_ids`、`positions`
-        2. 采样/投机解码需要的辅助信息，如 `logits_indices`、spec metadata
+        可以把这个函数看成“runner 侧的一次 batch 编排”：
+        scheduler 只负责告诉我们“哪些请求在本轮继续跑、每个请求跑多少个 token”，
+        而这里负责把这些按请求组织的状态，整理成模型前向真正消费的
+        “按 token 拍平”的 GPU 输入视图。
+
+        输入：
+            scheduler_output:
+                调度器本轮的决策，包含各请求调度 token 数、spec decode 的
+                draft token 等信息。
+            num_scheduled_tokens:
+                shape = [num_reqs]，按当前 `req_index` 顺序排列；
+                第 i 项表示“第 i 个活跃请求本轮要跑多少个 query token”。
+
+        这个函数主要做五件事：
+        1. 把“每请求多少 token”展开成拍平 token 视图，
+           例如构造 `req_indices`、`cu_num_tokens`、`positions`。
+        2. 从 `InputBatch` 的持久 CPU 状态中 gather 出本轮真正要送给模型的
+           token/embedding 输入。
+        3. 构造 attention / KV cache 相关的辅助张量，
+           如 `query_start_loc`、`seq_lens`、slot mapping。
+        4. 处理异步调度下的“上一轮 token 尚未回写 CPU”问题，
+           最终把 `input_ids`/`positions` 等张量准备到 GPU。
+        5. 计算采样阶段需要读取哪些 logits：
+           普通 decode/prefill 下是每请求 1 个位置；
+           speculative decoding 下则是一组 target/bonus logits。
 
         返回：
-            `(logits_indices, spec_decode_metadata)`
+            logits_indices:
+                `hidden_states` 上需要取出并送入 `compute_logits()` 的行下标。
+            spec_decode_metadata:
+                speculative decoding 需要的额外索引/元数据；普通路径下为 None。
         """
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        # 优化：先提交 block table 的拷贝，让它和后续 CPU 侧准备工作重叠。
+        # 阶段 0：先发起那些可以与 CPU 预处理重叠的 GPU 更新。
+        # block table 后面构造 attention metadata 时会用到，因此尽早提交。
         self.input_batch.block_table.commit_block_table(num_reqs)
 
-        # 展开“每个 token 属于哪个请求”。
+        # 阶段 1：从“按请求”视角切换到“按 token”视角。
+        #
+        # `req_indices` 长度等于本轮总 token 数；第 j 项表示“拍平后第 j 个 token
+        # 属于哪个请求”。后面 positions、slot mapping、gather input_ids 都基于它。
+        #
         # 例如 [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
-        # cu_num_tokens 是前缀和，arange 是每个请求内部的局部 token 下标。
+        # `cu_num_tokens` 是“每请求 token 数”的前缀和，给出每个请求在拍平 buffer
+        # 中的结束位置；`arange` 则是拍平后每个 token 在其所属请求内部的局部下标。
+        # 两者一起决定了：
+        # 1. query_start_loc / logits_indices 的边界
+        # 2. 本轮 token 在原始序列里的实际位置
+        #
         # 例如：
         # 输入 [2, 5, 3] -> `cu_num_tokens=[2, 7, 10]`, `arange=[0, 1, 0, 1, 2, 3, 4, 0, 1, 2]`
         cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
 
-        # 位置 = 历史已计算 token 数 + 本轮局部 offset。
+        # `positions_np[j]` 表示拍平后第 j 个 token 在“该请求完整序列”里的绝对位置。
+        # 公式 = 该请求历史已完成 forward 的 token 数 + 本轮局部 offset。
+        # decode 时通常只是在已有长度后追加；prefill/chunked prefill 时则可能是一段连续区间。
         positions_np = self.positions.np[:total_num_scheduled_tokens]
         np.add(
             self.input_batch.num_computed_tokens_cpu[req_indices],
@@ -1515,15 +1563,19 @@ class GPUModelRunner(
             out=positions_np,
         )
 
-        # M-RoPE 模型要额外生成 3D 位置编码。
+        # 某些模型的位置编码不止 1 维，因此这里顺手把对应 CPU buffer 也准备好。
+        # 真正 copy 到 GPU 在后面统一进行。
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
 
-        # XD-RoPE 模型同理。
         if self.uses_xdrope_dim > 0:
             self._calc_xdrope_positions(scheduler_output)
 
-        # 把二维 `[req_idx, token_pos]` 映射成拍平后的 token buffer 下标。
+        # 阶段 2：从 InputBatch 的持久 token 存储中 gather 出本轮输入。
+        #
+        # `InputBatch.token_ids_cpu_tensor` 按 `[req_idx, seq_pos]` 存储历史 token。
+        # 这里先把二维坐标映射成拍平的一维下标 `token_indices`，然后一次性 gather。
+        #
         # 例如：
         # [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # 对应拍平后下标 -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
@@ -1549,8 +1601,9 @@ class GPUModelRunner(
                 out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
             )
 
-        # InputBatch 并没有预分配一个巨大的 prompt_embeds CPU 缓冲区，
-        # 因此这里要把各请求的 prompt embeds 手动拷入 runner 侧的大 buffer。
+        # prompt embeds 不是稠密地预分配在 InputBatch 里的，
+        # 因此这里需要按请求逐段拷入 runner 自己维护的大型 staging buffer。
+        # 注意它和 token_ids 可能共存：同一批次里有的请求走 token id，有的走 embed。
         if self.input_batch.req_prompt_embeds:
             output_idx = 0
             for req_idx in range(num_reqs):
@@ -1586,10 +1639,16 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
+        # 阶段 3：构造 attention/KV cache 所需的布局信息。
+        #
+        # slot mapping 描述“拍平后的第 j 个 token 应该把 KV 写到哪个 cache slot”。
+        # 这一步做完后，attention backend 才知道本轮 query token 与历史 KV 的对应关系。
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
-        # 组装 attention metadata 依赖的基础张量。
+        # `query_start_loc` 是拍平 query buffer 上每个请求的起始 offset，形如：
+        # [0, q0, q0+q1, q0+q1+q2, ...]
+        # attention backend 用它把一维 query token 重新分段回“按请求”的视图。
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
         # 注意：某些 kernel（如 FlashAttention）要求 query_start_loc 单调不减，
@@ -1598,6 +1657,8 @@ class GPUModelRunner(
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
+        # `seq_lens` 是“本轮执行完成后”的序列长度，而不是本轮 query 长度。
+        # decode/prefill 共用同一份定义，后续 attention metadata / sampling mask 都依赖它。
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
         )
@@ -1608,20 +1669,23 @@ class GPUModelRunner(
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
 
-        # 标记哪些请求其实还没真正走到可采样位置。
-        # 后面若误采样了这些请求，会在返回前清掉结果。
+        # 某些 chunked prefill 请求本轮虽然参与 forward，但还没到“可以生成下一个 token”
+        # 的边界；这些请求后面会先走统一采样路径，再由 discard mask 丢弃采样结果。
         self.discard_request_mask.np[:num_reqs] = (
             self.seq_lens.np[:num_reqs] < num_tokens_np
         )
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
-        # 最后把输入 token 相关张量准备到 GPU。
+        # 阶段 4：真正把本轮输入 token 视图落到 GPU。
+        # 这里不仅仅是一次普通 copy；异步调度下还会把上一轮留在 GPU 上的 sampled token
+        # / draft token 修补回当前 `input_ids.gpu`，保证下一轮 decode 可以无缝续上。
         self._prepare_input_ids(
             scheduler_output,
             total_num_scheduled_tokens,
             cu_num_tokens,
         )
 
+        # 位置张量与 input_ids 类似，统一在这里上传到 GPU。
         if self.uses_mrope:
             # M-RoPE 的位置张量是 3D 的。
             self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
@@ -1638,14 +1702,20 @@ class GPUModelRunner(
             # 普通文本模型最常见，直接复制 1D positions。
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
+        # 阶段 5：确定“从哪些 hidden state 位置计算 logits 并进入采样”。
+        #
+        # 普通路径：每个请求只需要最后一个 query token 的 logits，所以每请求 1 个索引。
+        # spec decode：每个请求可能有多个 draft token，因此需要整组 target/bonus 索引。
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
             # NOTE(woosuk): chunked prefill 下，一个 batch 里可能包含“还没真正完成
             # 本轮可采样前向”的部分请求。这里为了简化实现仍会采样，
             # 但后面会忽略这些请求的 sampled token。
             # TODO: 后续补上 prompt logprobs 的支持。
+            # `query_start_loc[1:] - 1` 就是“每个请求在拍平 query 中的最后一个 token 下标”。
             logits_indices = query_start_loc[1:] - 1
             spec_decode_metadata = None
+            # 非 spec decode 下，每个请求本轮最多生成 1 个真实输出 token。
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
         else:
             # speculative decoding 时，需要知道每个请求本轮携带了多少个 draft token。
@@ -1675,7 +1745,7 @@ class GPUModelRunner(
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
 
-        # 本轮若 LoRA 激活集合变化，这里同步切换到正确的活跃 LoRA。
+        # LoRA 的 token-level 映射也依赖“本轮会采几个 token”，因此在这里一并更新。
         if self.lora_config:
             assert (
                 np.sum(num_sampled_tokens)
@@ -4661,7 +4731,7 @@ class GPUModelRunner(
         # （query_len == 1 + num_spec_decode_tokens）。
         #
         # 当 max_query_len == 1 时，FA2 会切到更适合纯 decode 的优化路径
-        #（例如 Flashdecode 以及 GQA/MQA 优化）。
+        # （例如 Flashdecode 以及 GQA/MQA 优化）。
         max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
 
         # 根据 `num_tokens` 和 `max_num_seqs` 构造一份“请求分布”，
@@ -4757,7 +4827,7 @@ class GPUModelRunner(
         )
 
         # `_dummy_run()` 与 `execute_model()` 共享一批 pinned CPU buffer
-        #（例如 `seq_lens`、`query_start_loc`）。
+        # （例如 `seq_lens`、`query_start_loc`）。
         # 因此它也必须走同一套 event 协议，避免前一轮 non_blocking H2D
         # 还在读时，后一轮 dummy/real run 提前覆写内存。
         with self.synchronize_input_prep():
